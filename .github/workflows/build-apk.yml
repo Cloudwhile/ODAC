@@ -60,6 +60,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check SDK validation
+        run: sh tests/build_sdk_test.sh
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
