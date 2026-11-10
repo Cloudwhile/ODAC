@@ -20,21 +20,43 @@ env:
 
 jobs:
   build:
-    name: package ${{ matrix.name }}
+    name: ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: mediatek-filogic
-            target: mediatek
-            subtarget: filogic
-            arch: aarch64_cortex-a53
-          - name: x86-64
+          - arch: aarch64_cortex-a53
+            target: bcm27xx
+            subtarget: bcm2710
+          - arch: aarch64_cortex-a72
+            target: mvebu
+            subtarget: cortexa72
+          - arch: aarch64_cortex-a76
+            target: bcm27xx
+            subtarget: bcm2712
+          - arch: aarch64_generic
+            target: armsr
+            subtarget: armv8
+          - arch: arm_cortex-a15_neon-vfpv4
+            target: armsr
+            subtarget: armv7
+          - arch: arm_cortex-a7_neon-vfpv4
+            target: ipq40xx
+            subtarget: generic
+          - arch: arm_cortex-a9_vfpv3-d16
+            target: mvebu
+            subtarget: cortexa9
+          - arch: mipsel_24kc
+            target: ramips
+            subtarget: mt7621
+          - arch: mips_24kc
+            target: ath79
+            subtarget: generic
+          - arch: x86_64
             target: x86
             subtarget: "64"
-            arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -57,8 +79,12 @@ jobs:
         run: |
           set -euo pipefail
           base="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
-          archive="openwrt-sdk-${SDK_VERSION}-${{ matrix.name }}_gcc-${SDK_GCC}_musl.Linux-x86_64.tar.zst"
           curl -fsSLO "${base}/sha256sums"
+          # The libc suffix in the archive name is musl for most targets and
+          # musl_eabi for the 32-bit ARM and mips ones, so read the name from
+          # the release manifest instead of guessing it.
+          archive=$(grep -oE "openwrt-sdk-${SDK_VERSION}-${{ matrix.target }}-${{ matrix.subtarget }}_gcc-[^ ]+_musl[^ ]*\.Linux-x86_64\.tar\.zst" sha256sums | head -1)
+          [ -n "$archive" ] || { echo "no SDK archive listed for ${{ matrix.target }}/${{ matrix.subtarget }}"; exit 1; }
           curl -fsSLO "${base}/${archive}"
           grep -F "${archive}" sha256sums | sha256sum -c -
           tar --zstd -xf "${archive}"
@@ -68,8 +94,9 @@ jobs:
       - name: Prepare the SDK configuration
         run: |
           set -euo pipefail
-          # The SDK usually ships a target .config. Recreate the target
-          # selection if it is missing so build-sdk.sh can verify it.
+          # A released SDK ships a target .config. Recreate the selection only
+          # when it is missing, so build-sdk.sh can still verify target and
+          # subtarget.
           if [ ! -f "${SDK_DIR}/.config" ]; then
             {
               echo "CONFIG_TARGET_${{ matrix.target }}=y"
@@ -81,7 +108,8 @@ jobs:
             } > "${SDK_DIR}/.config"
             make -C "${SDK_DIR}" defconfig
           fi
-          grep -E '^CONFIG_(VERSION_NUMBER|TARGET_BOARD|TARGET_SUBTARGET|USE_APK)=' "${SDK_DIR}/.config"
+          grep -E '^CONFIG_(TARGET_BOARD|TARGET_SUBTARGET|TARGET_ARCH_PACKAGES)=' "${SDK_DIR}/.config"
+          grep -Fqx "CONFIG_TARGET_ARCH_PACKAGES=\"${{ matrix.arch }}\"" "${SDK_DIR}/.config"
 
       - name: Build the packages
         run: scripts/build-sdk.sh "${SDK_DIR}" "${{ matrix.target }}" "${{ matrix.subtarget }}"
@@ -89,25 +117,31 @@ jobs:
       - name: Collect the APKs
         run: |
           set -euo pipefail
-          mkdir -p dist
-          find "${SDK_DIR}/bin/packages" -type f \
-            \( -name 'libargon2-*.apk' \
-            -o -name 'device-access-*.apk' \
-            -o -name 'luci-app-device-access-*.apk' \) \
-            -exec cp -v {} dist/ \;
+          arch="${{ matrix.arch }}"
           version=$(sed -n 's/^PKG_VERSION:=//p' device-access/Makefile)
-          [ -n "$(ls dist/device-access-${version}-*.apk 2>/dev/null)" ] || {
-            echo "device-access ${version} was not packaged"; ls -l dist; exit 1; }
-          [ -n "$(ls dist/luci-app-device-access-${version}-*.apk 2>/dev/null)" ] || {
-            echo "luci-app-device-access ${version} was not packaged"; ls -l dist; exit 1; }
-          [ -n "$(ls dist/libargon2-*.apk 2>/dev/null)" ] || {
-            echo "libargon2 was not packaged"; ls -l dist; exit 1; }
+          release=$(sed -n 's/^PKG_RELEASE:=//p' device-access/Makefile)
+          mkdir -p dist
+          # Publish under the release convention name-version-rN-arch.apk.
+          for dir in $(find "${SDK_DIR}/bin/packages" -type d -name "${arch}"); do
+            find "${dir}" -type f -name '*.apk' | while read -r apk; do
+              cp -v "${apk}" "dist/$(basename "${apk}" .apk)-${arch}.apk"
+            done
+          done
+          for pkg in device-access luci-app-device-access; do
+            [ -n "$(ls dist/${pkg}-${version}-r${release}-${arch}.apk 2>/dev/null)" ] || {
+              echo "${pkg} ${version}-r${release} was not packaged for ${arch}"; ls -l dist; exit 1; }
+          done
+          [ -n "$(ls dist/libargon2-*-${arch}.apk 2>/dev/null)" ] || {
+            echo "libargon2 was not packaged for ${arch}"; ls -l dist; exit 1; }
+          (cd dist && sha256sum ./*.apk > SHA256SUMS)
           ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: odac-apk-${{ matrix.arch }}
-          path: dist/*.apk
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
@@ -129,14 +163,11 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           mkdir -p out
-          for dir in dist/odac-apk-*; do
-            arch="${dir#dist/odac-apk-}"
-            for apk in "${dir}"/*.apk; do
-              cp "${apk}" "out/${arch}-$(basename "${apk}")"
-            done
-          done
+          find dist -name '*.apk' -exec cp -v {} out/ \;
+          # One combined checksum file for every architecture.
+          (cd out && sha256sum ./*.apk > SHA256SUMS)
           ls -l out
           gh release view "${tag}" >/dev/null 2>&1 ||
             gh release create "${tag}" --title "ODAC ${tag}" \
               --generate-notes --prerelease
-          gh release upload "${tag}" out/*.apk --clobber
+          gh release upload "${tag}" out/*.apk out/SHA256SUMS --clobber
