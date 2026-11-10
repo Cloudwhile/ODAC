@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <title>网络接入认证</title>
+    <link rel="stylesheet" href="portal.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="brand">
+        <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 20h.01" />
+          <path d="M2 8.82a15 15 0 0 1 20 0" />
+          <path d="M5 12.86a10 10 0 0 1 14 0" />
+          <path d="M8.5 16.43a5 5 0 0 1 7 0" />
+        </svg>
+        <div class="titles">
+          <h1 id="t-title">网络接入认证</h1>
+          <p id="t-subtitle">登录账号后即可访问互联网</p>
+        </div>
+        <button type="button" id="theme" class="icon" aria-label="切换主题">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 3a9 9 0 0 1 0 18z" />
+          </svg>
+        </button>
+      </header>
+
+      <section
+        id="banner"
+        class="banner"
+        role="status"
+        aria-live="polite"
+        hidden
+      ></section>
+
+      <section class="card" id="auth-card" aria-label="账号">
+        <div class="tabs" role="tablist" aria-label="账号操作">
+          <button
+            type="button"
+            role="tab"
+            id="tab-login"
+            aria-controls="p-login"
+            aria-selected="true"
+          >
+            登录
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-reg"
+            aria-controls="p-reg"
+            aria-selected="false"
+            tabindex="-1"
+          >
+            注册
+          </button>
+        </div>
+
+        <form
+          id="p-login"
+          role="tabpanel"
+          aria-labelledby="tab-login"
+          novalidate
+        >
+          <label
+            >用户名<input
+              name="username"
+              autocomplete="username"
+              autocapitalize="none"
+              spellcheck="false"
+              required
+              maxlength="32"
+          /></label>
+          <label
+            >密码<input
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              maxlength="128"
+          /></label>
+          <p class="err" aria-live="assertive"></p>
+          <button class="primary" type="submit"><span>登录</span></button>
+        </form>
+
+        <form
+          id="p-reg"
+          role="tabpanel"
+          aria-labelledby="tab-reg"
+          novalidate
+          hidden
+        >
+          <label
+            >用户名<input
+              name="username"
+              autocomplete="username"
+              autocapitalize="none"
+              spellcheck="false"
+              required
+              minlength="3"
+              maxlength="32"
+              pattern="[A-Za-z0-9_.-]{3,32}"
+            /><small>3–32 位字母、数字或 _ . -</small></label
+          >
+          <label
+            >密码<input
+              name="password"
+              type="password"
+              autocomplete="new-password"
+              required
+              minlength="6"
+              maxlength="128"
+            /><small>至少 6 位</small></label
+          >
+          <label
+            >确认密码<input
+              name="confirm_password"
+              type="password"
+              autocomplete="new-password"
+              required
+          /></label>
+          <p class="err" aria-live="assertive"></p>
+          <button class="primary" type="submit"><span>注册</span></button>
+          <p class="hint" id="t-register-hint">
+            每个设备只能注册一个账号，请牢记用户名和密码。
+          </p>
+        </form>
+      </section>
+
+      <section class="card" id="done-card" hidden aria-labelledby="done-h">
+        <h2 id="done-h">注册成功</h2>
+        <p>请返回登录页，使用刚注册的账号登录。</p>
+        <button type="button" id="done-back" class="primary">
+          <span>返回登录</span>
+        </button>
+      </section>
+
+      <section class="status" id="state-card" aria-labelledby="st-h">
+        <h2 id="st-h">本机状态</h2>
+        <dl class="kv">
+          <dt>本设备</dt>
+          <dd id="st-dev">—</dd>
+          <dt>会话</dt>
+          <dd id="st-sess">—</dd>
+        </dl>
+        <div class="row">
+          <button type="button" id="refresh" class="secondary">刷新状态</button>
+          <button type="button" id="logout" class="secondary danger" hidden>
+            退出登录
+          </button>
+        </div>
+      </section>
+
+      <footer>
+        <p id="t-footer">
+          本网络仅供授权用户使用。如遇到连接问题，请联系网络管理员。
+        </p>
+      </footer>
+    </main>
+    <script src="portal.js"></script>
+  </body>
+</html>
