@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in
+ list) printf '%s\n' '{"overview":{"params":{}},"users":{"params":{}},"registrations":{"params":{}},"devices":{"params":{}},"wan":{"params":{}},"audit":{"params":{}},"settings":{"params":{}},"user_update":{"params":{}},"approve":{"params":{}},"reject":{"params":{}},"device_update":{"params":{}},"disconnect":{"params":{}},"settings_update":{"params":{}},"backup":{"params":{}},"restore":{"params":{}}}';;
+ call)
+  case "${2:-}" in overview|users|registrations|devices|wan|audit|settings|user_update|approve|reject|device_update|disconnect|settings_update|backup|restore) ;; *) printf '%s\n' '{"ok":false,"error":{"code":"METHOD","message":"Unknown method"}}'; exit 0;; esac
+  input=$(head -c 65537)
+  [ "${#input}" -le 65536 ] || { printf '%s\n' '{"ok":false,"error":{"code":"TOO_LARGE","message":"Request too large"}}'; exit 0; }
+  # jshn.sh is not nounset safe: it unsets JSON_UNSET during json_cleanup and
+  # dereferences unset variables, so nounset is suspended for the library only.
+  set +u
+  . /usr/share/libubox/jshn.sh
+  json_load "$input" || { printf '%s\n' '{"ok":false,"error":{"code":"JSON","message":"Invalid request"}}'; exit 0; }
+  json_get_type kind params || kind=''
+  set -u
+  case "$kind" in
+   '') params='{}';;
+   object) params=$(printf '%s' "$input" | jsonfilter -e '@.params');;
+   *) printf '%s\n' '{"ok":false,"error":{"code":"PARAMS","message":"Params must be an object"}}'; exit 0;;
+  esac
+  response=$(printf '%s\n' "$params" | /usr/bin/odacctl "$2") || {
+   [ -n "$response" ] || response='{"ok":false,"error":{"code":"UNAVAILABLE","message":"ODAC unavailable"}}'
+  }
+  printf '%s\n' "$response"
+  exit 0
+  ;;
+ *) exit 2;;
+esac

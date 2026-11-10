@@ -1,0 +1,127 @@
+#!/bin/sh
+# Explicit local takeover; never creates or restarts network interfaces.
+set -eu
+umask 077
+[ "$(id -u)" = 0 ] || { echo 'Root required' >&2; exit 1; }
+[ "${1:-}" = --enable ] || { echo 'Usage: odac-setup --enable' >&2; exit 2; }
+/usr/libexec/odac-preflight --setup
+mkdir -p /etc/odac
+mkdir /var/lock/odac-setup.lock 2>/dev/null || { echo 'Setup already running' >&2; exit 1; }
+trap 'rmdir /var/lock/odac-setup.lock' EXIT
+backup=$(mktemp -d /etc/odac/setup-XXXXXXXX)
+retired=/etc/nftables.d/90-odac-retired.nft
+if [ -e "$retired" ]; then cp -p "$retired" "$backup/retired.nft"; fi
+for file in odac opennds uhttpd firewall; do cp -p "/etc/config/$file" "$backup/$file"; done
+/etc/init.d/opennds enabled && echo 1 > "$backup/opennds-enabled" || echo 0 > "$backup/opennds-enabled"
+iface=$(uci -q get odac.main.interface)
+gateway=$(uci -q get odac.main.gateway)
+http=$(uci -q get odac.main.portal_port)
+https=$(uci -q get odac.main.portal_https_port)
+host=$(uci -q get odac.main.portal_hostname)
+zone=$(uci -q get odac.main.zone)
+cert=$(uci -q get odac.main.tls_cert)
+key=$(uci -q get odac.main.tls_key)
+success=0
+rollback() {
+ rc=$?
+ trap - EXIT HUP INT TERM
+ if [ "$success" != 1 ]; then
+  /etc/init.d/odac stop || echo 'Warning: ODAC stop failed' >&2
+  /etc/init.d/opennds stop || echo 'Warning: openNDS stop failed' >&2
+  /etc/init.d/opennds disable || echo 'Warning: openNDS disable failed' >&2
+  for file in odac opennds uhttpd firewall; do
+   cp -p "$backup/$file" "/etc/config/$file.odac-rollback"
+   mv "/etc/config/$file.odac-rollback" "/etc/config/$file"
+  done
+  # Never restore an enabled configuration after failed takeover.
+  uci set odac.main.enabled=0; uci commit odac
+  /etc/init.d/odac disable || echo 'Warning: ODAC disable failed' >&2
+  /usr/libexec/odac-remove --retain-guard || echo 'CRITICAL: durable rollback guard failed; keep controlled network disconnected' >&2
+  if [ -f "$backup/retired.nft" ]; then
+   cp -p "$backup/retired.nft" "$retired.restore"
+   mv "$retired.restore" "$retired"
+   fw4 reload || echo 'CRITICAL: retired guard restoration reload failed' >&2
+  fi
+  echo "Setup failed; services disabled, guard retained. Backup: $backup" >&2
+ fi
+ rmdir /var/lock/odac-setup.lock
+ exit "$rc"
+}
+trap rollback EXIT
+trap 'exit 1' HUP INT TERM
+# First durable mutation is the fail-closed guard, before openNDS can grant.
+# shellcheck disable=SC2046 # one argument per configured upstream address
+/usr/libexec/odac-firewall init "$iface" "$gateway" "$http" "$https" $(uci -q get odac.main.upstream || true)
+/etc/init.d/odac stop
+/etc/init.d/opennds stop
+/etc/init.d/opennds disable
+stage="$backup/stage"
+mkdir "$stage"
+for file in odac opennds uhttpd firewall; do cp -p "$backup/$file" "$stage/$file"; done
+UCI() { uci -c "$stage" "$@"; }
+UCI set opennds.@opennds[0].gatewayinterface="$iface"
+UCI set opennds.@opennds[0].gatewayport=2050
+UCI set opennds.@opennds[0].login_option_enabled=0
+# ndsctl reauth recreates records after deauth; nft stays closed until verified.
+# Static preemptivemac/trustedmac grants remain prohibited by preflight.
+UCI set opennds.@opennds[0].allow_preemptive_authentication=1
+UCI set opennds.@opennds[0].fasport="$http"
+UCI set opennds.@opennds[0].faspath=/cgi-bin/landing
+UCI set opennds.@opennds[0].fas_secure_enabled=1
+UCI set opennds.@opennds[0].fwhook_enabled=1
+UCI set opennds.@opennds[0].faskey="$(openssl rand -hex 32)"
+UCI -q delete opennds.@opennds[0].fasremoteip || true
+UCI -q delete opennds.@opennds[0].fasremotefqdn || true
+UCI -q delete opennds.@opennds[0].users_to_router || true
+# users_to_router is a list option; setting it as a string makes add_list fail.
+UCI add_list opennds.@opennds[0].users_to_router="allow tcp port $https"
+# fw4 script includes run outside the inet fw4 table.
+UCI set firewall.odac_guard=include
+UCI set firewall.odac_guard.type=script
+UCI set firewall.odac_guard.path=/etc/odac/firewall-include
+UCI set firewall.odac_guard.fw4_compatible=1
+for item in dns dhcp http https nds; do
+ UCI set firewall.odac_$item=rule
+ UCI set firewall.odac_$item.src="$zone"
+ UCI set firewall.odac_$item.target=ACCEPT
+ UCI set firewall.odac_$item.family=ipv4
+done
+UCI set firewall.odac_dns.proto='tcp udp'; UCI set firewall.odac_dns.dest_port=53
+UCI set firewall.odac_dhcp.proto=udp; UCI set firewall.odac_dhcp.src_port=68; UCI set firewall.odac_dhcp.dest_port=67
+UCI set firewall.odac_http.proto=tcp; UCI set firewall.odac_http.dest_port="$http"
+UCI set firewall.odac_https.proto=tcp; UCI set firewall.odac_https.dest_port="$https"
+UCI set firewall.odac_nds.proto=tcp; UCI set firewall.odac_nds.dest_port=2050
+UCI set odac.main.enabled=1
+UCI commit
+for file in odac opennds firewall; do
+ cp -p "$stage/$file" "/etc/config/$file.odac-new"
+ mv "/etc/config/$file.odac-new" "/etc/config/$file"
+done
+# Closed standalone guard is already installed. Remove only the validated,
+# backed-up retirement file before committing the replacement fw4 ruleset.
+if [ -f "$backup/retired.nft" ]; then rm "$retired"; fi
+fw4 check
+fw4 reload
+/usr/libexec/odac-config
+/etc/init.d/odac enable
+/etc/init.d/odac start
+# odacctl subscribes to socket readiness before checking, bounded to 20s.
+printf '{}' | /usr/bin/odacctl --wait-ready | jsonfilter -e '@.ok' | grep -qx true
+# Separate procd HTTPS process: the listener must present the operator
+# certificate and answer a portal request. Chain trust is the operator's
+# responsibility, so the served certificate is compared instead of the
+# public CA chain, which an isolated network cannot provide.
+served=$(printf '' | openssl s_client -connect "$gateway:$https" -servername "$host" 2>/dev/null \
+ | openssl x509 -noout -fingerprint -sha256 2>/dev/null) || served=''
+configured=$(openssl x509 -in "$cert" -noout -fingerprint -sha256)
+[ -n "$served" ] || { echo 'Portal HTTPS listener did not present a certificate' >&2; exit 1; }
+[ "$served" = "$configured" ] || { echo 'Portal HTTPS listener served a different certificate' >&2; exit 1; }
+curl --fail --silent --show-error --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 20 --max-time 10 --noproxy '*' \
+ --cacert "$cert" --resolve "$host:$https:$gateway" "https://$host:$https/" >/dev/null 2>&1 \
+ || echo 'Warning: portal HTTPS request was not trusted by the local CA; the listener certificate matches the operator certificate' >&2
+ndsctl json >/dev/null
+nft list table inet odac_guard >/dev/null
+printf '%s\n' "$backup" > /etc/odac/last-setup.new
+mv /etc/odac/last-setup.new /etc/odac/last-setup
+success=1
+printf 'ODAC enabled. Backup: %s\n' "$backup"

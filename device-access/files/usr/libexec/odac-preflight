@@ -1,0 +1,146 @@
+#!/bin/sh
+# Read-only prerequisites. No interface/service/configuration changes.
+# nounset is not used: the OpenWrt shell library reads unset variables by
+# design, so `set -u` aborts inside config_get/config_foreach. Every value
+# that matters is checked explicitly below.
+set -e
+. /lib/functions.sh
+fail() { echo "ODAC preflight: $*" >&2; exit 1; }
+get() { uci -q get "odac.main.$1"; }
+# OpenWrt busybox has no stat applet, so ownership and mode come from ls.
+owner_is_root() { [ "$(ls -ld "$1" | awk '{print $3}')" = root ]; }
+mode_is() {
+ expected=$2
+ actual=$(ls -ld "$1" | awk '{print $1}' | cut -c2-10)
+ [ "$actual" = "$expected" ]
+}
+. /etc/openwrt_release
+case "$DISTRIB_RELEASE" in 25.12.*) ;; *) fail 'OpenWrt 25.12.x required';; esac
+for cmd in apk ubus uci jsonfilter nft fw4 ndsctl conntrack uhttpd openssl curl; do
+ command -v "$cmd" >/dev/null || fail "Missing command: $cmd"
+done
+network=$(get network); iface=$(get interface); zone=$(get zone); gateway=$(get gateway)
+case "$network:$zone:$iface" in *[!a-zA-Z0-9_.:-]*|'') fail 'Invalid network/zone/interface name';; esac
+[ -n "$network" ] && [ -n "$zone" ] && [ -n "$iface" ] || fail 'Select isolated network, device and zone'
+case "$network:$zone:$iface" in lan:*|wan:*|wan6:*|*:lan:*|*:wan:*|*:br-lan|*:eth0|*:eth1) fail 'Reserved management/uplink selection';; esac
+[ "$(uci -q get network.$network.proto)" = static ] || fail 'Controlled network must be existing static interface'
+[ "$(uci -q get network.$network.device)" = "$iface" ] || fail 'Controlled device mismatch'
+[ "$(uci -q get network.$network.ipaddr)" = "$gateway" ] || fail 'Gateway does not match static network'
+mask=$(uci -q get network.$network.netmask) || fail 'Explicit IPv4 netmask required'
+[ -d "/sys/class/net/$iface" ] || fail 'Controlled device is not present'
+retired=/etc/nftables.d/90-odac-retired.nft
+if [ -e "$retired" ] || [ -L "$retired" ]; then
+ [ -f "$retired" ] && [ ! -L "$retired" ] || fail 'Retired guard must be a regular file'
+ owner_is_root "$retired" || fail 'Retired guard must be root owned'
+ expected=$(printf 'chain odac_retired_forward { type filter hook forward priority -10; policy accept; iifname "%s" drop; oifname "%s" drop; }\nchain odac_retired_input { type filter hook input priority -10; policy accept; iifname "%s" drop; }\n' "$iface" "$iface" "$iface")
+ [ "$(cat "$retired")" = "$expected" ] || fail 'Retired guard differs or protects another device; review manually'
+fi
+# Arithmetic IPv4 overlap check; reject bad addresses/masks rather than guessing.
+overlap() {
+ awk -v a="$1" -v m="$2" -v b="$3" -v n="$4" 'function ip(s, p,i,v){if(split(s,p,".")!=4)return -1;v=0;for(i=1;i<=4;i++){if(p[i]!~/^[0-9]+$/||p[i]>255)return -1;v=v*256+p[i]}return v} function prefix(s, v,k){if(s~/^[0-9]+$/&&s<=32)return s;v=ip(s);if(v<0)return -1;for(k=0;k<=32;k++)if(v==4294967296-2^(32-k))return k;return -1} BEGIN {a=ip(a);b=ip(b);m=prefix(m);n=prefix(n);if(a<0||b<0||m<0||n<0)exit 2;k=(m<n?m:n);exit int(a/2^(32-k))!=int(b/2^(32-k))}'
+}
+overlap "$gateway" "$mask" "$gateway" "$mask" || fail 'Invalid controlled subnet'
+check_network() {
+ local section="$1" dev proto state addresses cidr ip prefix static_ip static_mask
+ [ "$section" = "$network" ] && return 0
+ config_get proto "$section" proto
+ [ "$proto" = none ] && return 0
+ config_get dev "$section" device
+ [ -z "$dev" ] || [ "$dev" != "$iface" ] || fail 'Device shared with other network'
+ config_get static_ip "$section" ipaddr
+ config_get static_mask "$section" netmask
+ for cidr in $static_ip; do
+  ip=${cidr%/*}; prefix=${cidr#*/}
+  [ "$prefix" != "$cidr" ] || prefix="$static_mask"
+  if overlap "$gateway" "$mask" "$ip" "$prefix"; then fail "Subnet overlaps configured $section"; else [ "$?" = 1 ] || fail 'Invalid configured subnet'; fi
+ done
+ state=$(ubus call "network.interface.$section" status) || fail "Cannot inspect network $section"
+ dev=$(printf '%s' "$state" | jsonfilter -e '@.l3_device')
+ [ "$dev" != "$iface" ] || fail 'Runtime device shared with another network'
+ addresses=$(printf '%s' "$state" | jsonfilter -e '@["ipv4-address"][*].address')
+ for ip in $addresses; do
+  prefix=$(printf '%s' "$state" | jsonfilter -e "@[\"ipv4-address\"][@.address=\"$ip\"].mask")
+  if overlap "$gateway" "$mask" "$ip" "$prefix"; then fail "Subnet overlaps $section"; else [ "$?" = 1 ] || fail 'Invalid runtime subnet'; fi
+ done
+}
+config_load network
+config_foreach check_network interface
+for option in ip6addr ip6assign ip6hint; do
+ [ -z "$(uci -q get network.$network.$option || true)" ] || fail 'Controlled IPv6 addressing unsupported'
+done
+state=$(ubus call "network.interface.$network" status) || fail 'Controlled interface is offline'
+[ "$(printf '%s' "$state" | jsonfilter -e '@.up')" = true ] || fail 'Controlled interface must already be up'
+[ -z "$(printf '%s' "$state" | jsonfilter -e '@["ipv6-address"][*].address' -e '@["ipv6-prefix"][*].address')" ] || fail 'Runtime IPv6 addressing unsupported'
+dhcp_found=0
+check_dhcp() {
+ local section="$1" net ignore value
+ config_get net "$section" interface
+ [ "$net" = "$network" ] || return 0
+ config_get ignore "$section" ignore 0
+ [ "$ignore" = 0 ] || fail 'DHCP disabled'
+ for value in ra dhcpv6 ndp; do
+  local mode
+  config_get mode "$section" "$value" disabled
+  [ "$mode" = disabled ] || fail 'Disable RA, DHCPv6 and NDP on controlled DHCP section'
+ done
+ dhcp_found=1
+}
+config_load dhcp
+config_foreach check_dhcp dhcp
+[ "$dhcp_found" = 1 ] || fail 'Existing isolated DHCP section required'
+zone_found=0
+check_zone() {
+ local section="$1" name nets input forward
+ config_get name "$section" name
+ config_get nets "$section" network
+ if [ "$name" = "$zone" ]; then
+  [ "$nets" = "$network" ] || fail 'Controlled zone must contain only controlled network'
+  config_get input "$section" input
+  config_get forward "$section" forward
+  case "$input:$forward" in REJECT:REJECT|DROP:DROP|REJECT:DROP|DROP:REJECT) ;; *) fail 'Controlled zone input/forward must reject or drop';; esac
+  zone_found=$((zone_found + 1))
+ else
+  case " $nets " in *" $network "*) fail 'Controlled network belongs to another firewall zone';; esac
+ fi
+}
+check_offload() {
+ local value
+ config_get value "$1" flow_offloading 0
+ [ "$value" = 0 ] || fail 'Software flow offloading must be disabled'
+ config_get value "$1" flow_offloading_hw 0
+ [ "$value" = 0 ] || fail 'Hardware flow offloading must be disabled'
+}
+config_load firewall
+config_foreach check_zone zone
+config_foreach check_offload defaults
+[ "$zone_found" = 1 ] || fail 'Exactly one dedicated isolated zone required'
+# Do not coexist with bypass grants from another openNDS policy.
+for option in trustedmac preemptivemac; do
+ [ -z "$(uci -q get opennds.@opennds[0].$option || true)" ] || fail "Existing openNDS $option bypasses ODAC policy"
+done
+preemptive=$(uci -q get opennds.@opennds[0].allow_preemptive_authentication || echo 1)
+case "$preemptive" in 1) ;; 0) [ "${1:-}" = --setup ] || fail 'Run explicit setup to enable controlled ndsctl preemptive authentication';; *) fail 'Invalid preemptive authentication value';; esac
+help=$(ndsctl -h 2>&1 || true)
+printf '%s' "$help" | grep -q 'uploadrate' || fail 'Unsupported ndsctl auth API'
+printf '%s' "$help" | grep -q 'json' || fail 'Unsupported ndsctl JSON API'
+/usr/sbin/uhttpd -h 2>&1 | grep -q -- '-s' || fail 'uhttpd TLS support required'
+http=$(get portal_port); https=$(get portal_https_port)
+for port in "$http" "$https"; do
+ case "$port" in ''|*[!0-9]*) fail 'Invalid portal port';; esac
+ [ "$port" -gt 1024 ] && [ "$port" -le 65535 ] || fail 'Use unprivileged dedicated portal ports'
+done
+[ "$http" != "$https" ] || fail 'HTTP and HTTPS ports must differ'
+[ "$http" != 2050 ] && [ "$https" != 2050 ] || fail 'Port 2050 is reserved for openNDS gateway'
+host=$(get portal_hostname); cert=$(get tls_cert); key=$(get tls_key)
+case "$host" in ''|*[!a-zA-Z0-9.-]*|.*|*.) fail 'Trusted DNS portal hostname required';; esac
+case "$cert:$key" in /*:/*) ;; *) fail 'TLS certificate/key paths must be absolute';; esac
+[ -r "$cert" ] && [ -r "$key" ] || fail 'Readable operator TLS certificate and key required'
+owner_is_root "$key" || fail 'TLS private key must be root owned'
+mode_is "$key" "r--------" || mode_is "$key" "rw-------" || fail 'TLS private key must be mode 400 or 600'
+openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null || fail 'Certificate expires within one day'
+openssl x509 -in "$cert" -noout -checkhost "$host" >/dev/null || fail 'Certificate hostname mismatch'
+# The actual HTTPS health check verifies trust, chain, private key and listener.
+status=$(get status_file)
+case "$status" in /*) ;; *) fail 'Configure the absolute path of the upstream status file';; esac
+printf '%s
+' 'ODAC preflight passed (runtime acceptance testing still required)'

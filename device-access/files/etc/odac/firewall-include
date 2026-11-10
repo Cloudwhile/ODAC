@@ -1,0 +1,9 @@
+#!/bin/sh
+# Called by fw4 script include, outside the fw4 table. Never remove the guard.
+set -eu
+iface=$(uci -q get odac.main.interface)
+gateway=$(uci -q get odac.main.gateway)
+http=$(uci -q get odac.main.portal_port)
+https=$(uci -q get odac.main.portal_https_port)
+# shellcheck disable=SC2046 # one argument per configured upstream address
+exec /usr/libexec/odac-firewall init "$iface" "$gateway" "$http" "$https" $(uci -q get odac.main.upstream || true)

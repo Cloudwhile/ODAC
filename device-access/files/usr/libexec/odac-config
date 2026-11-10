@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+umask 077
+mkdir -p /var/run/odac /etc/odac
+chmod 700 /var/run/odac /etc/odac
+# jshn.sh is not nounset safe: it unsets JSON_UNSET during json_cleanup and
+# dereferences unset variables, so nounset is suspended for the library only.
+set +u
+. /usr/share/libubox/jshn.sh
+json_init
+for key in database socket_path interface gateway upstream status_file pid_file portal_hostname tls_cert tls_key; do
+ json_add_string "$key" "$(uci -q get odac.main.$key || true)"
+done
+for key in enabled portal_port portal_https_port session_seconds max_users max_devices max_sessions upload_kbps download_kbps wan_interval max_audit db_max_kib; do
+ value=$(uci -q get odac.main.$key) || exit 1
+ case "$value" in ''|*[!0-9]*) echo "Invalid numeric ODAC option: $key" >&2; exit 1;; esac
+ json_add_int "$key" "$value"
+done
+json_dump > /var/run/odac/config.json.new
+mv /var/run/odac/config.json.new /var/run/odac/config.json

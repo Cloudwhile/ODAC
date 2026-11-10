@@ -1,0 +1,27 @@
+#!/bin/sh
+# Record the upstream authentication state for ODAC.
+#
+# The administrator's own login script calls this after each attempt:
+#
+#   /usr/libexec/odac-wan-state ONLINE
+#   /usr/libexec/odac-wan-state AUTH_REQUIRED
+#
+# ODAC reads this file only. It never touches the upstream portal itself.
+set -eu
+[ "$(id -u)" = 0 ] || { echo 'Root required' >&2; exit 1; }
+state=${1:-}
+case "$state" in
+ ONLINE|REAUTHENTICATING|AUTH_REQUIRED|OFFLINE|UNKNOWN) ;;
+ *) echo 'Usage: odac-wan-state ONLINE|REAUTHENTICATING|AUTH_REQUIRED|OFFLINE|UNKNOWN' >&2; exit 2;;
+esac
+path=$(uci -q get odac.main.status_file || true)
+[ -n "$path" ] || path=/var/run/odac/upstream.status
+case "$path" in /*) ;; *) echo 'Invalid status file path' >&2; exit 1;; esac
+dir=$(dirname "$path")
+mkdir -p "$dir"
+chmod 700 "$dir"
+umask 077
+tmp="$path.$$"
+printf 'state=%s\nupdated=%s\n' "$state" "$(date +%s)" > "$tmp"
+mv "$tmp" "$path"
+chmod 600 "$path"

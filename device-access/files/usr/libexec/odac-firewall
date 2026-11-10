@@ -1,0 +1,149 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Root-only, fixed argv API (all input validated before nft sees it):
+# init IFACE GATEWAY HTTP_PORT HTTPS_PORT [UPSTREAM_IPV4...]
+# gate IFACE online|closed LEASE_SECONDS(1..90)
+# auth IFACE MAC IPV4 LEASE_SECONDS(1..90)
+# deauth IFACE MAC IPV4
+# close IFACE
+# Requires nft >=1.0.9 (destroy element), the pinned openNDS nft backend,
+# and disabled flow offloading. Never flush ruleset or delete guard on stop.
+# Every transaction is atomic. "init" replaces ONLY this table atomically and
+# closes all leases. fw4 reload must preserve foreign tables (standard fw4).
+# No output hook: router upstream authentication remains untouched.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C
+fail() { echo 'odac-firewall: invalid request or unavailable guard' >&2; exit 1; }
+iface_ok() {
+    [ -n "$1" ] && [ "${#1}" -le 15 ] || return 1
+    case "$1" in [!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*|lo) return 1;; esac
+}
+number() {
+    case "$1" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
+    [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le "$2" ]
+}
+ip_ok() {
+    case "$1" in ''|*[!0-9.]*|.*|*.) return 1;; esac
+    local oldifs="$IFS"; IFS=.; set -- $1; IFS="$oldifs"
+    [ "$#" -eq 4 ] || return 1
+    for octet in "$@"; do
+        case "$octet" in ''|*[!0-9]*|0[0-9]*) return 1;; esac
+        [ "${#octet}" -le 3 ] && [ "$octet" -le 255 ] || return 1
+    done
+    [ "$1" -gt 0 ] && [ "$1" -lt 224 ] && [ "$1" -ne 127 ]
+}
+mac_ok() {
+    # Unicast only (I/G bit clear in first octet), never all-zero.
+    [ "${#1}" -eq 17 ] || return 1
+    case "$1" in
+        [0-9a-fA-F][02468aAcCeE]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) :;;
+        *) return 1;;
+    esac
+    [ "$1" != '00:00:00:00:00:00' ]
+}
+[ "$(id -u)" -eq 0 ] || fail
+[ "$#" -ge 2 ] || fail
+op="$1"; iface="$2"
+iface_ok "$iface" || fail
+[ -d "/sys/class/net/$iface" ] || fail
+if [ "$op" = init ]; then
+    [ "$#" -ge 5 ] && [ "$#" -le 21 ] || fail
+    ip_ok "$3" && number "$4" 65535 && number "$5" 65535 || fail
+    # Refuse management ports even when misconfigured; setup verifies isolation.
+    case "$4" in 22|80|443|2050) fail;; esac
+    case "$5" in 22|80|443|2050) fail;; esac
+    [ "$4" != "$5" ] || fail
+    # The MAC.IP binding rule needs an Ethernet link-layer header; on other link
+    # types the ether expression cannot match and would not drop.
+    [ "$(cat "/sys/class/net/$iface/type")" = 1 ] || fail
+    gateway="$3"; http="$4"; https="$5"
+    shift 5
+    # Upstream portal addresses are operator configuration (up to 16); none
+    # are built in. Each one is blocked in both directions on the controlled side.
+    upstream=''
+    for address in "$@"; do
+        ip_ok "$address" || fail
+        upstream="${upstream:+$upstream, }$address"
+    done
+    upstream_elements=''
+    [ -z "$upstream" ] || upstream_elements="elements = { $upstream }; "
+    # add is idempotent; delete + recreate in ONE batch leaves no packet window.
+    nft -f - <<EOF
+add table inet odac_guard
+delete table inet odac_guard
+table inet odac_guard {
+    set controlled { type ifname; elements = { "$iface" }; }
+    set online { type ifname; flags timeout; timeout 90s; }
+    set clients { type ether_addr . ipv4_addr; flags timeout; timeout 90s; size 1024; }
+    set replies { type ipv4_addr; flags timeout; timeout 90s; size 1024; }
+    set upstream { type ipv4_addr; ${upstream_elements}}
+    set blocked4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }; }
+    chain input_guard {
+        type filter hook input priority -10; policy accept;
+        iifname "$iface" meta nfproto ipv6 drop
+        iifname "$iface" udp sport 68 udp dport 67 return
+        iifname "$iface" ip daddr $gateway udp dport 53 return
+        iifname "$iface" ip daddr $gateway tcp dport { 53, $http, $https, 2050 } return
+        iifname "$iface" drop
+    }
+    chain forward_guard {
+        type filter hook forward priority -10; policy accept;
+        iifname "$iface" meta nfproto ipv6 drop
+        oifname "$iface" meta nfproto ipv6 drop
+        iifname "$iface" ip daddr @upstream drop
+        oifname "$iface" ip saddr @upstream drop
+        iifname "$iface" ip daddr @blocked4 drop
+        oifname "$iface" ip saddr @blocked4 drop
+        iifname "$iface" iifname != @online drop
+        oifname "$iface" oifname != @online drop
+        iifname "$iface" ether saddr . ip saddr != @clients drop
+        oifname "$iface" ip daddr != @replies drop
+        oifname "$iface" ct state != { established, related } drop
+    }
+}
+EOF
+    exit $?
+fi
+# Exact stored interface match prevents a call for a similarly named network.
+nft get element inet odac_guard controlled "{ \"$iface\" }" >/dev/null 2>&1 || fail
+case "$op" in
+    gate)
+        [ "$#" -eq 4 ] && number "$4" 90 || fail
+        case "$3" in
+            online)
+                nft -f - <<EOF
+flush set inet odac_guard online
+add element inet odac_guard online { "$iface" timeout ${4}s }
+EOF
+                ;;
+            closed) nft flush set inet odac_guard online;;
+            *) fail;;
+        esac
+        ;;
+    auth)
+        [ "$#" -eq 5 ] && mac_ok "$3" && ip_ok "$4" && number "$5" 90 || fail
+        nft -f - <<EOF
+destroy element inet odac_guard clients { $3 . $4 }
+destroy element inet odac_guard replies { $4 }
+add element inet odac_guard clients { $3 . $4 timeout ${5}s }
+add element inet odac_guard replies { $4 timeout ${5}s }
+EOF
+        ;;
+    deauth)
+        [ "$#" -eq 4 ] && mac_ok "$3" && ip_ok "$4" || fail
+        nft -f - <<EOF
+destroy element inet odac_guard clients { $3 . $4 }
+destroy element inet odac_guard replies { $4 }
+EOF
+        ;;
+    close)
+        [ "$#" -eq 2 ] || fail
+        nft -f - <<EOF
+flush set inet odac_guard online
+flush set inet odac_guard clients
+flush set inet odac_guard replies
+EOF
+        ;;
+    *) fail;;
+esac
