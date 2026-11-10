@@ -60,7 +60,7 @@ jobs:
           archive="openwrt-sdk-${SDK_VERSION}-${{ matrix.name }}_gcc-${SDK_GCC}_musl.Linux-x86_64.tar.zst"
           curl -fsSLO "${base}/sha256sums"
           curl -fsSLO "${base}/${archive}"
-          grep -F " ${archive}\$" sha256sums | sha256sum -c -
+          grep -F "${archive}" sha256sums | sha256sum -c -
           tar --zstd -xf "${archive}"
           echo "SDK_DIR=${PWD}/${archive%.tar.zst}" >> "$GITHUB_ENV"
           df -h /
