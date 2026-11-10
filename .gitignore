@@ -1,0 +1,27 @@
+build/
+*.o
+*.a
+*.apk
+__pycache__/
+*.pyc
+
+# Privacy: certificates, keys, databases, logs and local env files stay out.
+*.pem
+*.key
+*.crt
+*.p12
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+
+# Prompt and agent instruction files stay out of the repository.
+CLAUDE.md
+AGENTS.md
+AGENT.md
+*.prompt.md
+*.instructions.md
+.claude/
+.cursor/
