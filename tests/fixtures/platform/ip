@@ -1,0 +1,8 @@
+#!/bin/sh
+# Test double for /sbin/ip (tests only): "ip -4 neigh show".
+[ "$*" = "-4 neigh show" ] || exit 1
+cat <<'EOF'
+192.168.50.10 dev odactest0 lladdr aa:bb:cc:dd:ee:01 REACHABLE
+192.168.50.12 dev br-lan lladdr aa:bb:cc:4f:59:ff REACHABLE
+192.168.79.40 dev odactest0  FAILED
+EOF

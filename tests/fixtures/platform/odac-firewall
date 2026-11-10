@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test double for /usr/libexec/odac-firewall (tests only): records argv.
+dir=$(dirname "$0")
+printf 'fw|' >> "$dir/log"; for a in "$@"; do printf '%s|' "$a" >> "$dir/log"; done; echo >> "$dir/log"

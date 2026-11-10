@@ -1,0 +1,28 @@
+#!/bin/sh
+# Test double for /usr/bin/ndsctl (tests only). Mimics openNDS JSON shapes:
+# "json" -> full list, "json SELECTOR" -> one object or {}; auth by token/MAC;
+# deauth of an authenticated client deletes it (official openNDS behavior).
+dir=$(dirname "$0"); state="$dir/.nds-a"
+printf 'ndsctl|' >> "$dir/log"; for a in "$@"; do printf '%s|' "$a" >> "$dir/log"; done; echo >> "$dir/log"
+[ -f "$state" ] || echo Preauthenticated > "$state"
+a_state=$(cat "$state")
+a() { printf '{"mac":"aa:bb:cc:dd:ee:01","ip":"192.168.50.10","clientif":"odactest0","token":"0123abcd","state":"%s","upload_this_session":"2","download_this_session":"3","last_active":"100"}' "$a_state"; }
+b() { printf '{"mac":"aa:bb:cc:dd:ee:02","ip":"192.168.50.11","token":"89abcdef","state":"Authenticated"}'; }
+case "$1" in
+json)
+    case "${2-}" in
+    '') printf '{"client_list_length":"2","clients":{'
+        [ "$a_state" = Deleted ] || { printf '"aa:bb:cc:dd:ee:01":'; a; printf ','; }
+        printf '"aa:bb:cc:dd:ee:02":'; b; printf '}}\n';;
+    aa:bb:cc:dd:ee:01|192.168.50.10|0123abcd) if [ "$a_state" = Deleted ]; then echo '{}'; else a; echo; fi;;
+    aa:bb:cc:dd:ee:02|192.168.50.11|89abcdef) b; echo;;
+    *) echo '{}';;
+    esac;;
+auth)
+    case "$2" in 0123abcd|aa:bb:cc:dd:ee:01) echo Authenticated > "$state"; echo "Client $2 authenticated."; exit 0;; esac
+    exit 1;;
+deauth)
+    if [ "$2" = aa:bb:cc:dd:ee:01 ] && [ "$a_state" = Authenticated ]; then echo Deleted > "$state"; exit 0; fi
+    exit 1;;
+*) exit 1;;
+esac
