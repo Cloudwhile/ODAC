@@ -1,0 +1,142 @@
+name: build-apk
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDK_VERSION: "25.12.2"
+  SDK_GCC: "14.3.0"
+
+jobs:
+  build:
+    name: package ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mediatek-filogic
+            target: mediatek
+            subtarget: filogic
+            arch: aarch64_cortex-a53
+          - name: x86-64
+            target: x86
+            subtarget: "64"
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bzip2 build-essential cpio diffstat file g++ gawk gettext git \
+            libelf-dev libncurses-dev libssl-dev patch perl python3 \
+            python3-setuptools rsync time unzip wget xz-utils zlib1g-dev zstd
+
+      - name: Download and verify the SDK
+        run: |
+          set -euo pipefail
+          base="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
+          archive="openwrt-sdk-${SDK_VERSION}-${{ matrix.name }}_gcc-${SDK_GCC}_musl.Linux-x86_64.tar.zst"
+          curl -fsSLO "${base}/sha256sums"
+          curl -fsSLO "${base}/${archive}"
+          grep -F " ${archive}\$" sha256sums | sha256sum -c -
+          tar --zstd -xf "${archive}"
+          echo "SDK_DIR=${PWD}/${archive%.tar.zst}" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Prepare the SDK configuration
+        run: |
+          set -euo pipefail
+          # The SDK usually ships a target .config. Recreate the target
+          # selection if it is missing so build-sdk.sh can verify it.
+          if [ ! -f "${SDK_DIR}/.config" ]; then
+            {
+              echo "CONFIG_TARGET_${{ matrix.target }}=y"
+              echo "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}=y"
+              echo "CONFIG_TARGET_BOARD=\"${{ matrix.target }}\""
+              echo "CONFIG_TARGET_SUBTARGET=\"${{ matrix.subtarget }}\""
+              echo "CONFIG_TARGET_ARCH_PACKAGES=\"${{ matrix.arch }}\""
+              echo "CONFIG_USE_APK=y"
+            } > "${SDK_DIR}/.config"
+            make -C "${SDK_DIR}" defconfig
+          fi
+          grep -E '^CONFIG_(VERSION_NUMBER|TARGET_BOARD|TARGET_SUBTARGET|USE_APK)=' "${SDK_DIR}/.config"
+
+      - name: Build the packages
+        run: scripts/build-sdk.sh "${SDK_DIR}" "${{ matrix.target }}" "${{ matrix.subtarget }}"
+
+      - name: Collect the APKs
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "${SDK_DIR}/bin/packages" -type f \
+            \( -name 'libargon2-*.apk' \
+            -o -name 'device-access-*.apk' \
+            -o -name 'luci-app-device-access-*.apk' \) \
+            -exec cp -v {} dist/ \;
+          version=$(sed -n 's/^PKG_VERSION:=//p' device-access/Makefile)
+          [ -n "$(ls dist/device-access-${version}-*.apk 2>/dev/null)" ] || {
+            echo "device-access ${version} was not packaged"; ls -l dist; exit 1; }
+          [ -n "$(ls dist/luci-app-device-access-${version}-*.apk 2>/dev/null)" ] || {
+            echo "luci-app-device-access ${version} was not packaged"; ls -l dist; exit 1; }
+          [ -n "$(ls dist/libargon2-*.apk 2>/dev/null)" ] || {
+            echo "libargon2 was not packaged"; ls -l dist; exit 1; }
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: odac-apk-${{ matrix.arch }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: attach the APKs to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: odac-apk-*
+
+      - name: Upload the APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p out
+          for dir in dist/odac-apk-*; do
+            arch="${dir#dist/odac-apk-}"
+            for apk in "${dir}"/*.apk; do
+              cp "${apk}" "out/${arch}-$(basename "${apk}")"
+            done
+          done
+          ls -l out
+          gh release view "${tag}" >/dev/null 2>&1 ||
+            gh release create "${tag}" --title "ODAC ${tag}" \
+              --generate-notes --prerelease
+          gh release upload "${tag}" out/*.apk --clobber
