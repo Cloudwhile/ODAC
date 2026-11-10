@@ -1,0 +1,36 @@
+{
+	"admin/services/device-access": {
+		"title": "设备准入控制",
+		"order": 60,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-device-access" ] }
+	},
+	"admin/services/device-access/dashboard": {
+		"title": "总览", "order": 10,
+		"action": { "type": "view", "path": "device-access/dashboard" }
+	},
+	"admin/services/device-access/accounts": {
+		"title": "账号管理", "order": 20,
+		"action": { "type": "view", "path": "device-access/accounts" }
+	},
+	"admin/services/device-access/registrations": {
+		"title": "注册审批", "order": 30,
+		"action": { "type": "view", "path": "device-access/registrations" }
+	},
+	"admin/services/device-access/devices": {
+		"title": "设备管理", "order": 40,
+		"action": { "type": "view", "path": "device-access/devices" }
+	},
+	"admin/services/device-access/bandwidth": {
+		"title": "带宽管理", "order": 50,
+		"action": { "type": "view", "path": "device-access/bandwidth" }
+	},
+	"admin/services/device-access/wan": {
+		"title": "上游认证", "order": 60,
+		"action": { "type": "view", "path": "device-access/wan" }
+	},
+	"admin/services/device-access/settings": {
+		"title": "系统设置", "order": 70,
+		"action": { "type": "view", "path": "device-access/settings" }
+	}
+}

@@ -1,0 +1,23 @@
+{
+	"luci-app-device-access": {
+		"description": "Grant access to ODAC device access controller",
+		"read": {
+			"ubus": {
+				"odac": [ "overview", "users", "registrations", "devices", "wan", "audit", "settings" ]
+			},
+			"file": {
+				"/tmp/odac-backup.json": [ "read" ]
+			},
+			"cgi-io": [ "download" ]
+		},
+		"write": {
+			"ubus": {
+				"odac": [ "user_update", "approve", "reject", "device_update", "disconnect", "settings_update", "backup", "restore" ]
+			},
+			"file": {
+				"/tmp/odac-restore.json": [ "write" ]
+			},
+			"cgi-io": [ "upload" ]
+		}
+	}
+}
