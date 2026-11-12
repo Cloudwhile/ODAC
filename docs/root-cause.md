@@ -283,12 +283,47 @@ Make prerequisite trace，不能把每一条边都视为已证实。SDK 的 feed
   autogen 还会导入 gnulib 模块。这是两类不同工作。
 - gettext 首次耗时 301.92 s，后续两次目标访问均为 0.35 s；
   gnulib-l10n 首次 2.64 s，后续均为 0.32 s，不能把重复目标名当作完整重编译。
-  GnuTLS 则确实又执行了一次配置/编译，耗时从首次 222.54 s 到第二次 221.41 s；
-  触发第二次构建的 stamp/依赖原因尚未确定。
+  GnuTLS 则确实又执行了一次配置/编译，耗时从首次 222.54 s 到第二次 221.41 s。
 
-当前已缓存 SDK 归档和下载源码，尚未验证跨 Job 的宿主编译产物复用。
-构建产物没有保存 `.config` 前后差异和生成的 `.packagedeps`，完整因果链、
-预编译 host 工具清单及同条件冷/热缓存收益仍待补证。不得直接删除依赖来提速。
+三次相同构建步骤的 x86/64 运行（43154130757、43180259567、43186925580，
+产物逐字节一致）的日志还显示：
+
+- **构建是串行的**。`build-sdk.sh` 调用 `make` 时没有给 `-j`，日志里 19 处
+  包级子 make 全部是 `make -j1`。
+- **四次 `make` 调用之间有重复工作**。`package/kernel/linux/compile` 在后三次
+  调用中各执行一遍，每遍重新执行 966 次 APK 打包（其中 965 个是 `kmod-*`，
+  165–211 s/遍）。
+  GnuTLS 的两次完整编译分别落在第 2、3 次调用，第三次访问只用 0.26 s。
+- **GnuTLS 第二次编译的原因仍是待证实的解释**。两次编译之间
+  `pkginfo/libopenssl.version` 等 15 个库版本文件被写入；上游
+  `include/package.mk` 让 prepare stamp 依赖配方内各子包传递依赖的
+  `pkginfo/*.version`，而 gnutls 配方的 `libgnutls-dane` 依赖 `libunbound`，
+  后者依赖 `libopenssl`。这与「第 3 次调用编译 OpenSSL 后 GnuTLS 的 stamp
+  过期」相符，但没有那次 `make -q -d` 的输出，不能当作已确认。内核包重做的
+  stamp 原因同样未确定。
+- **依赖边的机制按上游脚本推导，尚待生成的依赖图核对**。生成依赖图的
+  `scripts/package-metadata.pl`（v25.12.2）按源码包聚合所有子包的 `DEPENDS`，
+  未选中的变体也计入。libmicrohttpd 配方的 `libmicrohttpd-ssl` 写的是
+  `DEPENDS:=+libgnutls`，按该脚本会生成「libmicrohttpd 编译前先编译 gnutls」
+  的边，与是否选中 ssl 变体无关；gnutls 再经
+  `PKG_BUILD_DEPENDS:=gettext-full/host` 拉起 gettext 宿主工具及其
+  `HOST_BUILD_DEPENDS`。日志顺序（gettext 宿主 → gmp → nettle → gnutls →
+  libmicrohttpd/nossl，全部在 odac-opennds 调用内）与此一致。此前的构建没有
+  保存生成的 `.packagedeps`，所以这条边本身还没有被直接读到。
+  这些是 SDK 构建图要求的依赖，不删除。
+- **选中的包符号有 1473 个，其中 1176 个是 `kmod-*`**，尽管输入配置写了
+  `# CONFIG_ALL_KMODS is not set`。来源未确认，确认前不改动选择。
+- **Runner 之间的波动很大**。相同步骤的总时长为 2403、2486、3105 s
+  （gettext 302/313/384 s），单次对比不足以证明提速或变慢。
+
+据此 `build-sdk.sh` 改为**一次** `make` 调用并传入 `-j$(nproc)`：目标是依赖
+其余三包的 `luci-app-device-access`，随后检查四个包都已产出。依赖和包选择
+不变。构建脚本同时把 defconfig 前后的配置和生成的 `tmp/.packagedeps` 存入
+诊断产物（`sdk-config-input`、`sdk-config`、`packagedeps.mk`），用于逐边核对
+上面仍待证实的部分。实测结果记录在[部署文档](deployment.md)的验收表。
+
+SDK 归档和下载源码的缓存不缩短编译（缓存命中的 43180259567 为 2486 s）。
+跨 Job 复用宿主编译产物尚未验证，预编译 host 工具清单仍待补证。
 
 基线日志中的耗时（来自 `time: package/.../compile#用户#系统#总计`）：
 

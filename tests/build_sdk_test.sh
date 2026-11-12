@@ -204,25 +204,90 @@ case "$1" in
 			printf 'CONFIG_%s=m\n' "$symbol" >> .config
 		done
 		[ "${STOCK_OPENNDS:-0}" = 0 ] || printf 'CONFIG_PACKAGE_opennds=m\n' >> .config
+		mkdir -p tmp
+		echo '# generated dependency graph' > tmp/.packagedeps
 		exit 0
 		;;
 	*/compile)
+		# Record the whole command line and emulate the packages that one
+		# goal produces through its dependencies.
+		echo "$*" >> "${MAKE_LOG}"
 		mkdir -p bin/packages/x86_64/base
+		for package in libargon2-20190702-r1 odac-opennds-10.3.1-r1 \
+			device-access-0.1.0-r1 luci-app-device-access-0.1.0-r1
+		do
+			file="bin/packages/x86_64/base/${package}.apk"
+			case "$package" in
+				"${MISSING_PACKAGE:-none}"-[0-9]*) rm -f "$file";;
+				*) : > "$file";;
+			esac
+		done
 		exit 0
 		;;
 esac
 exit 0
 EOF
 chmod +x "$work/bin/make"
+export MAKE_LOG="$work/make.log"
+: > "$MAKE_LOG"
+mkdir "$work/diagnostics"
 
 rc=0
-PATH="$work/bin:$PATH" run_build x86 64 || rc=$?
+PATH="$work/bin:$PATH" run_build x86 64 ODAC_BUILD_JOBS=3 ODAC_BUILD_DIAGNOSTICS="$work/diagnostics" || rc=$?
 if [ "$rc" -eq 0 ]; then
 	ok 'the build accepts a configuration with CONFIG_ALL disabled'
 else
 	not_ok 'the build accepts a configuration with CONFIG_ALL disabled'
 	cat "$work/output" >&2
 fi
+
+# Separate make runs repeated dependency work, so the packages are built by
+# exactly one run whose goal reaches all four, with an explicit job count.
+if [ "$(wc -l < "$MAKE_LOG")" -eq 1 ] &&
+	grep -qx 'package/odac/luci-app-device-access/compile V=s -j3' "$MAKE_LOG"; then
+	ok 'the packages are built by one make run with the requested job count'
+else
+	not_ok 'the packages are built by one make run with the requested job count'
+	cat "$MAKE_LOG" >&2
+fi
+
+# The configuration before and after defconfig and the generated dependency
+# graph are kept as build evidence.
+if grep -Fqx 'CONFIG_PACKAGE_device-access=m' "$work/diagnostics/sdk-config-input" &&
+	! grep -Fq 'CONFIG_PACKAGE_curl' "$work/diagnostics/sdk-config-input" &&
+	grep -Fqx 'CONFIG_PACKAGE_curl=m' "$work/diagnostics/sdk-config" &&
+	[ -s "$work/diagnostics/packagedeps.mk" ]; then
+	ok 'the configuration before and after defconfig and the dependency graph are saved'
+else
+	not_ok 'the configuration before and after defconfig and the dependency graph are saved'
+	ls -l "$work/diagnostics" >&2
+fi
+
+# The single goal reaches three packages through dependencies. A package the
+# run did not produce must fail the build here instead of surfacing later.
+for missing in libargon2 odac-opennds device-access luci-app-device-access; do
+	rc=0
+	PATH="$work/bin:$PATH" run_build x86 64 ODAC_BUILD_JOBS=1 MISSING_PACKAGE="$missing" || rc=$?
+	if [ "$rc" -ne 0 ] && grep -q "No package matching ${missing}-" "$work/output"; then
+		ok "a build that does not produce ${missing} is rejected"
+	else
+		not_ok "a build that does not produce ${missing} is rejected (exit $rc)"
+		cat "$work/output" >&2
+	fi
+done
+
+# The job count is passed to make, so it must be a plain positive number.
+for jobs in 0 4x -4 '2 V=99'; do
+	: > "$MAKE_LOG"
+	rc=0
+	PATH="$work/bin:$PATH" run_build x86 64 ODAC_BUILD_JOBS="$jobs" || rc=$?
+	if [ "$rc" -ne 0 ] && [ ! -s "$MAKE_LOG" ]; then
+		ok "the job count '${jobs}' is rejected before make runs"
+	else
+		not_ok "the job count '${jobs}' is rejected before make runs (exit $rc)"
+		cat "$work/output" >&2
+	fi
+done
 
 # The verification must accept the comment form Kconfig actually writes.
 if grep -qx '# CONFIG_ALL is not set' "$sdk/.config"; then

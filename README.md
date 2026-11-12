@@ -225,8 +225,10 @@ scripts/build-sdk.sh /path/to/sdk/mediatek-filogic-gcc-14.3.0_musl.Linux-x86_64 
 依赖由 feeds 工具递归解析，SDK 会聚合同一源码包各变体的依赖。
 CI 日志确认：gettext/gnulib 的首次宿主编译出现在 `odac-opennds` 编译阶段，
 GnuTLS 配置实际使用 gettext 提供的 autopoint；libmicrohttpd-no-ssl 则明确
-使用 `--without-gnutls`。完整的源码包依赖边和 GnuTLS 重编译原因仍需生成的
-Make 依赖图补证，不能由 feeds 安装记录推断运行时依赖或直接删除依赖。
+使用 `--without-gnutls`。上游脚本按源码包聚合各变体的依赖，与 gnutls 被构建
+相符；但此前的构建没有保存生成的依赖图，这条边尚未直接核对，现随诊断产物
+上传。四个包改由一次并行 `make` 构建，以避免多次调用之间的重复工作；
+依赖不删除，提速效果以 CI 实测为准。
 证据与未完成项见 [根因分析](docs/root-cause.md)。
 
 本机可运行（Linux 主机，无需路由器；需要 json-c、SQLite 与 Argon2 的开发头文件和库）：

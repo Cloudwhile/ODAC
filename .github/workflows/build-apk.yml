@@ -280,6 +280,9 @@ jobs:
           start=$SECONDS
           mkdir -p diagnostics
           export ODAC_BUILD_METRICS="${PWD}/diagnostics/build-metrics.tsv"
+          # The SDK configuration before and after defconfig and the
+          # generated dependency graph are kept with the diagnostics.
+          export ODAC_BUILD_DIAGNOSTICS="${PWD}/diagnostics"
           rc=0
           sh scripts/build-sdk.sh "${SDK_DIR}" "${TARGET}" "${SUBTARGET}" > diagnostics/sdk-build.log 2>&1 || rc=$?
           echo "SDK build exit status: ${rc} (full log in diagnostic artifact)"

@@ -15,8 +15,9 @@
 #   * install_src() walks source and host build dependencies, including other
 #     variants in a source recipe. Feed installation alone does not establish
 #     which variant causes compilation. CI shows GnuTLS using host gettext's
-#     autopoint; the exact generated dependency edges and repeated GnuTLS
-#     build still need tracing (docs/root-cause.md). Keep dependencies intact.
+#     autopoint. The generated dependency graph is saved with the diagnostics
+#     so the edges can be read, not inferred (docs/root-cause.md). Keep
+#     dependencies intact.
 #
 #   * The SDK ships no .config. A minimal configuration is written first and
 #     then completed by "make defconfig", which is the only way to get a
@@ -157,7 +158,21 @@ printf '\n==> configuring\n'
 # An absent CONFIG_ALL takes the SDK default y. Explicitly disable it and
 # select the four roots above; defconfig resolves their dependency closure.
 
+# Keep the configuration before and after defconfig and the generated
+# dependency graph: they show what the build compiles and why.
+diagnostics=${ODAC_BUILD_DIAGNOSTICS:-}
+[ -z "$diagnostics" ] || cp .config "$diagnostics/sdk-config-input"
+
 make defconfig
+
+if [ -n "$diagnostics" ]; then
+	cp .config "$diagnostics/sdk-config"
+	if [ -f tmp/.packagedeps ]; then
+		cp tmp/.packagedeps "$diagnostics/packagedeps.mk"
+	else
+		echo 'tmp/.packagedeps was not generated; the dependency graph is not saved'
+	fi
+fi
 
 # --- verification ------------------------------------------------------------
 
@@ -224,14 +239,19 @@ grep -E '^CONFIG_PACKAGE_.*=[ym]$' .config | sed 's/^/    /'
 # --- build -------------------------------------------------------------------
 
 printf '\n==> building\n'
-start_stage argon2_compile_and_package
-make package/odac/argon2/compile V=s
-start_stage admission_compile_and_package
-make package/odac/odac-opennds/compile V=s
-start_stage backend_compile_and_package
-make package/odac/device-access/compile V=s
-start_stage luci_compile_and_package
-make package/odac/luci-app-device-access/compile V=s
+# One make run with one goal. luci-app-device-access depends on device-access,
+# which depends on the Argon2 library and odac-opennds, so this goal builds
+# all four; the result is checked below. Four separate runs repeated work in
+# CI: package/kernel/linux was packaged in three of them and GnuTLS was
+# compiled twice (docs/root-cause.md). The job count only adds parallelism;
+# the selected packages and their dependencies are unchanged.
+jobs=${ODAC_BUILD_JOBS:-$(nproc)}
+case "$jobs" in
+	''|*[!0-9]*|0*) echo "Invalid job count '${jobs}'" >&2; exit 1;;
+esac
+printf 'Build jobs: %s\n' "$jobs"
+start_stage packages_compile_and_package
+make package/odac/luci-app-device-access/compile V=s "-j${jobs}"
 start_stage package_discovery
 
 printf '\n==> produced packages\n'
@@ -240,4 +260,10 @@ printf '\n==> produced packages\n'
 # this fresh SDK's bin tree; collection validates package metadata separately.
 package_dir="bin"
 [ -d "$package_dir" ] || { echo "the package directory ${package_dir} does not exist" >&2; exit 1; }
-find "$package_dir" -type f \( -name 'libargon2-*.apk' -o -name 'odac-opennds-*.apk' -o -name 'device-access-*.apk' -o -name 'luci-app-device-access-*.apk' \) -print
+# The single goal reaches three of the packages through dependencies, so each
+# of the four must be present; a missing one fails here, not later.
+for pattern in 'libargon2-*.apk' 'odac-opennds-*.apk' 'device-access-*.apk' 'luci-app-device-access-*.apk'; do
+	produced=$(find "$package_dir" -type f -name "$pattern" -print)
+	[ -n "$produced" ] || { echo "No package matching ${pattern} was produced" >&2; exit 1; }
+	printf '%s\n' "$produced"
+done
