@@ -92,6 +92,10 @@ struct json_object *odac_json_parse_strict(const char *text, size_t length, int 
     if (has_high) {
         escaped = odac_json_escape_utf8(text, length, &source_length);
         if (!escaped) return NULL;
+        /* Every valid sequence is now a \u escape; any remaining high byte is
+         * invalid UTF-8, which json-c 0.17 would otherwise accept. */
+        for (size_t i = 0; i < source_length; i++)
+            if ((unsigned char)escaped[i] >= 0x80) { free(escaped); return NULL; }
         source = escaped;
     }
     struct json_tokener *t = json_tokener_new_ex(depth);
