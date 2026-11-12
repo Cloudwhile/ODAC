@@ -73,9 +73,19 @@ char *odac_json_escape_utf8(const char *text, size_t length, size_t *out_length)
 struct json_object *odac_json_parse_strict(const char *text, size_t length, int depth)
 {
     if (!text || !length || length > 0x7fffffff || memchr(text, 0, length)) return NULL;
-    int has_high = 0;
-    for (size_t i = 0; i < length; i++)
-        if ((unsigned char)text[i] >= 0x80) { has_high = 1; break; }
+    /* RFC 8259 forbids unescaped control characters inside strings. json-c
+     * 0.17 accepts them even in strict mode, so reject them here instead of
+     * depending on the library version. */
+    int has_high = 0, in_string = 0, after_backslash = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0x80) has_high = 1;
+        if (!in_string) { if (c == '"') in_string = 1; continue; }
+        if (after_backslash) { after_backslash = 0; continue; }
+        if (c == '\\') after_backslash = 1;
+        else if (c == '"') in_string = 0;
+        else if (c < 0x20) return NULL;
+    }
     const char *source = text;
     size_t source_length = length;
     char *escaped = NULL;
