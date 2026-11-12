@@ -78,6 +78,9 @@ def check(workflow, rows):
         errors.append("architecture independent APKs must declare noarch")
     if '"${apk_bin}" adbdump' not in collect:
         errors.append("collection must read actual APK metadata")
+    for script in ("scripts/check-apk-content.py", "scripts/check-apk-elf.py"):
+        if f"python3 -I {script}" not in collect:
+            errors.append(f"collection must run {script}")
     if '"${SDK_DIR}" "${TARGET}" "${SUBTARGET}"' not in bodies.get("build", ""):
         errors.append("build must receive SDK_DIR, TARGET and SUBTARGET")
 

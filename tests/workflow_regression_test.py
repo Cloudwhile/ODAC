@@ -52,6 +52,8 @@ class WorkflowTests(unittest.TestCase):
             (lambda w: change_step(w, "sdk", "--archive", "--unused"), "SDK verification"),
             (lambda w: change_step(w, "collect", '${SDK_DIR}/bin"', '${SDK_DIR}/bin/packages"'), "package discovery"),
             (lambda w: change_step(w, "collect", "expected=noarch", "expected=all"), "declare noarch"),
+            (lambda w: change_step(w, "collect", "python3 -I scripts/check-apk-content.py", "true"), "check-apk-content.py"),
+            (lambda w: change_step(w, "collect", "python3 -I scripts/check-apk-elf.py", "true"), "check-apk-elf.py"),
             (lambda w: change_step(w, "build", '"${SUBTARGET}"', '"${NOT_DEFINED}"'), "build must receive"),
         ]
         for mutate, expected in cases:

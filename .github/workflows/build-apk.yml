@@ -382,6 +382,10 @@ jobs:
             dump="diagnostics/${pkg}.dump"
             "${apk_bin}" adbdump "$found" > "$dump"
             python3 -I scripts/check-apk-content.py "$dump" "$pkg"
+            # The declared arch is metadata. Read the payload itself: every
+            # file must match its listed hash, and the ELF headers, loader
+            # and SONAME must match the target.
+            python3 -I scripts/check-apk-elf.py "$found" "$dump" "$expected"
             cp "${found}" "dist/${pkg}-${version}-${target}-${subtarget}.apk"
           done
 

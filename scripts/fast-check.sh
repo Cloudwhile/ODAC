@@ -113,6 +113,7 @@ fi
 
 stage 'APK content checker regression tests'
 python3 -I tests/apk_content_test.py || fail 'APK content checker tests failed'
+python3 -I tests/apk_elf_test.py || fail 'APK payload and ELF checker tests failed'
 
 # --- 6. build scope resolution ------------------------------------------------
 
