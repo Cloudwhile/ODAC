@@ -43,6 +43,14 @@ paths: # 4 items
     files: # 2 items
       - name: opennds
       - name: ndsctl
+  - name: usr/libexec
+    files:
+      - name: odac-opennds-check
+        acl:
+          mode: 0755
+          user: root
+          group: root
+        hash: DNS_CHECK_HASH
 scripts:
   post-install: |
     #!/bin/sh
@@ -54,7 +62,8 @@ class ContentTest(unittest.TestCase):
     def setUp(self):
         text = NDS
         for token, path in [('CONFIG_HASH', 'etc/config/opennds'),
-                            ('INIT_HASH', 'etc/init.d/opennds')]:
+                            ('INIT_HASH', 'etc/init.d/opennds'),
+                            ('DNS_CHECK_HASH', 'usr/libexec/odac-opennds-check')]:
             digest = hashlib.sha256(
                 (ROOT / 'odac-opennds/files' / path).read_bytes()).hexdigest()
             text = text.replace(token, digest)
@@ -67,6 +76,24 @@ class ContentTest(unittest.TestCase):
     def test_actual_tree_shape_and_source_hashes(self):
         self.assertNotIn('etc/init.d/opennds', self.text)
         self.assertEqual(checker.check('odac-opennds', self.text, ROOT), [])
+        missing = copy.deepcopy(self.data)
+        missing['paths'] = [path for path in missing['paths']
+                            if path.get('name') != 'usr/libexec']
+        self.assertTrue(any('does not ship usr/libexec/odac-opennds-check' in error
+                            for error in self.check_data(missing)))
+
+    def test_backend_requires_dns_isolated_admission_version(self):
+        data = {'info': {'name': 'device-access',
+                         'depends': ['odac-opennds>=10.3.1-r2']},
+                'paths': [{'files': [{'name': 'fixture'}]}]}
+        def dependency_errors():
+            return [message for message in checker.check(
+                'device-access', yaml.safe_dump(data), ROOT)
+                if 'must require' in message]
+        self.assertEqual(dependency_errors(), [])
+        for depends in ([], ['odac-opennds'], ['odac-opennds>=10.3.1-r1']):
+            data['info']['depends'] = depends
+            self.assertTrue(dependency_errors())
 
     def test_library_package_has_lib_prefix(self):
         text = '''info:
@@ -103,7 +130,7 @@ paths:
                 self.assertTrue(self.check_data(data))
 
     def test_same_path_with_changed_content_rejected(self):
-        for index in (1, 2):
+        for index in (1, 2, 4):
             with self.subTest(index=index):
                 data = copy.deepcopy(self.data)
                 data['paths'][index]['files'][0]['hash'] = '0' * 64

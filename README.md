@@ -130,7 +130,8 @@ ODAC 由四个 APK 组成：`libargon2`、`odac-opennds`、`device-access`、
 ~~~
 
 准入后端是 `odac-opennds`，而不是官方 `opennds` 包。它用同一份上游源码
-（openNDS 10.3.1，校验和与官方配方一致）编译，只替换了安装生命周期：
+（openNDS 10.3.1，校验和与官方配方一致）加上共享 DNS/DHCP 隔离补丁编译，
+并替换安装生命周期：
 
 - OpenWrt 的 `default_postinst`（`/lib/functions.sh`）会对新装包的每个
   `/etc/init.d/*` 执行 `enable` 和 `start`，依赖包的 postinst 先于 ODAC 运行，
@@ -289,7 +290,9 @@ CI 的完整说明（SDK 校验、APK 元数据校验、Release 保护、缓存�
   （`users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0`）
   下已做 VM 诊断观察：规则仅引用受控接口，WAN6 不变。固定上游版本源码确认
   正常启动请求三次共享 dnsmasq reload，终止请求一次 restart；配置选项不能抑制。
-  失败日志原因、实际 DNS 影响与真实客户端准入尚待验证。
+  `odac-opennds` r2 源码补丁已移除这些共享 DNS/DHCP 调用，init、daemon 及
+  device-access r3 preflight 会拒绝依赖这些功能的配置。新包待 CI 与 VM 验收；
+  旧版失败日志原因、实际 DNS 影响与真实客户端准入尚待验证。
 - 受控客户端只能访问门户端口，不能直连路由器的 SSH/LuCI，这是设计意图。
 - 真实路由器上的安装、验收与性能**尚未验证**。整改后的四个包已由 CI 构建，并在
   x86/64 测试虚拟机上完成安装、默认状态检查、卸载和重新安装。r1 启用暴露

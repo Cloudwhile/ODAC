@@ -515,11 +515,19 @@ EOF
 		chmod +x "$ROOTDIR/$tool"
 	done
 	chmod +x "$ROOTDIR/nft"
+	# Redirect only the absolute checker path into this test sandbox.
+	# Its configuration logic is exercised separately in opennds_dns_test.py.
+	sed "s|/usr/libexec/odac-opennds-check|$ROOTDIR/usr/libexec/odac-opennds-check|g" \
+		"$ROOT/odac-opennds/files/etc/init.d/opennds" > "$ROOTDIR/opennds-init"
+	if [ "${6:-ok}" != missing ]; then
+		printf '#!/bin/sh\nexit %s\n' "${6:-0}" > "$ROOTDIR/usr/libexec/odac-opennds-check"
+		chmod +x "$ROOTDIR/usr/libexec/odac-opennds-check"
+	fi
 	cat > "$ROOTDIR/run-init.sh" <<EOF
 procd_open_instance() { echo procd_open >> "$ROOTDIR/calls.all"; }
 procd_set_param() { echo "procd_set \$*" >> "$ROOTDIR/calls.all"; }
 procd_close_instance() { echo procd_close >> "$ROOTDIR/calls.all"; }
-. "$ROOT/odac-opennds/files/etc/init.d/opennds"
+. "$ROOTDIR/opennds-init"
 start_service
 echo "start_rc \$?" >> "$ROOTDIR/calls.all"
 type stop_service >/dev/null 2>&1 && echo has_stop_service >> "$ROOTDIR/calls.all"
@@ -560,6 +568,13 @@ check 'activated: WAN6 configuration unchanged' "$(uci get network.wan6.proto)" 
 check 'no stop_service that would revert network changes' "$(count_matches "$ROOTDIR/calls.all" '^has_stop_service$')" 0
 cleanup_root
 
+nds_case 1 1 1 br-odac 1 1
+nds_inert 'DNS integration configuration rejected'
+cleanup_root
+nds_case 1 1 1 br-odac 1 missing
+nds_inert 'DNS isolation checker missing'
+cleanup_root
+
 # Package contract: installs disabled, unowned interface, no uci-defaults.
 cfg=$ROOT/odac-opennds/files/etc/config/opennds
 contains 'odac-opennds ships disabled' "$(cat "$cfg")" "option enabled '0'"
@@ -567,6 +582,10 @@ contains 'odac-opennds ships without fw4 hook' "$(cat "$cfg")" "option fwhook_en
 contains 'odac-opennds does not touch the fw4 input chain' "$(cat "$cfg")" "option users_to_router_passthrough '1'"
 contains 'odac-opennds does not touch DNS or DHCP option 114' "$(cat "$cfg")" "option dhcp_default_url_enable '0'"
 absent 'odac-opennds does not default to br-lan' "$(cat "$cfg")" 'br-lan'
+checker=$(cat "$ROOT/odac-opennds/files/usr/libexec/odac-opennds-check")
+contains 'DNS checker rejects shared gateway FQDN changes' "$checker" 'gatewayfqdn must be disabled'
+contains 'DNS checker rejects DHCP option 114 changes' "$checker" 'DHCP option 114 management is unsupported'
+contains 'DNS checker rejects domain list changes' "$checker" 'requires shared DNS changes'
 mk=$(cat "$ROOT/odac-opennds/Makefile")
 install_rules=$(sed -n '/^define Package\/odac-opennds\/install/,/^endef/p' "$ROOT/odac-opennds/Makefile" | grep -v '^[[:space:]]*#')
 absent 'odac-opennds installs no uci-defaults' "$install_rules" 'uci-defaults'

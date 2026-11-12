@@ -230,6 +230,27 @@ class Deployment(unittest.TestCase):
             retired.symlink_to(target)
             self.assertNotEqual(subprocess.run(['sh', '-c', script], timeout=5).returncode, 0)
 
+    def test_dns_isolation_check_is_required_by_preflight(self):
+        source = (LIBEXEC / 'odac-preflight').read_text()
+        block = source[source.index('[ -x /usr/libexec/odac-opennds-check ]'):
+                       source.index('# Do not coexist with bypass grants')]
+        with tempfile.TemporaryDirectory() as directory:
+            checker = Path(directory) / 'odac-opennds-check'
+            script = ('set -eu\nfail() { printf "%s\\n" "$*" >&2; exit 1; };\n' +
+                      block.replace('/usr/libexec/odac-opennds-check', str(checker)))
+            for state, expected in [('missing', 1), ('reject', 1), ('accept', 0)]:
+                with self.subTest(state=state):
+                    if state != 'missing':
+                        checker.write_text('#!/bin/sh\nexit ' + ('1' if state == 'reject' else '0') + '\n')
+                        checker.chmod(0o755)
+                    result = subprocess.run(['sh', '-c', script], capture_output=True,
+                                            text=True, timeout=5)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if state == 'missing':
+                        self.assertIn('checker is missing', result.stderr)
+                    elif state == 'reject':
+                        self.assertIn('unsupported by ODAC', result.stderr)
+
     def test_preemptive_default_and_gateway_port_contract(self):
         source = (LIBEXEC / 'odac-preflight').read_text()
         preemptive = source[source.index('preemptive=$('):source.index('help=$(ndsctl')]

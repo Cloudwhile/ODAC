@@ -149,6 +149,19 @@ LuCI 不可用与管理链路异常的**候选机制**，但不能单独解释�
 这些结论来自固定上游版本的调用链；本轮未核对 VM 可执行文件与上游源码的
 逐字节对应关系，也未测定其安装的 dnsmasq init/procd reload 行为。
 
+后续源码修复：`odac-opennds` 升为 10.3.1-r2，用窄补丁删除 daemon 启停的
+DHCP revert、dnsmasq reload/restart 和全局 nftset helper 调用；不修改上游
+认证/helper 脚本，保留客户端认证、撤权以及 nds 防火墙初始化和清理。
+`odac-opennds-check` 是只读配置检查，在 init、daemon 以及 device-access r3
+的 preflight 中拒绝 gateway FQDN、DHCP option 114 和依赖共享 DNS 的域名/端口
+列表，避免静默忽略已配置策略。检查所有 section，拒绝额外类型，防止上游跨 section
+取列表时遗漏策略；daemon 检查放在会修改防火墙的 `config_init()` 之前。
+device-access r3 的安装依赖要求 `odac-opennds>=10.3.1-r2`，防止保留旧后端后
+才在启用阶段发现 checker 缺失。管理员预配置的 DHCP/DNS 继续由系统维护。
+补丁对固定 SHA256 的上游归档严格套用成功；配置守门测试和 APK 检查器回归
+通过，VM 当前配置以 stdin 执行只读 checker 退出 0。新二进制尚待 CI；未进行
+VM 升级或启用，不据此宣称共享 DNS 运行验收或准入验收通过。
+
 ---
 
 ## 根因 2：硬依赖 `libustream-mbedtls` 触发 TLS 提供者替换

@@ -180,6 +180,13 @@ def check(apk_bytes, dump_text, arch):
         if info is None:
             continue
         count += 1
+        if path == 'usr/bin/opennds':
+            if b'/usr/libexec/odac-opennds-check' not in content:
+                failures.append(f'{path}: missing ODAC DNS isolation check')
+            for command in (b'/usr/lib/opennds/dnsconfig.sh',
+                            b'/usr/lib/opennds/libopennds.sh nftset'):
+                if command in content:
+                    failures.append(f'{path}: contains shared DNS lifecycle command {command.decode()}')
         report.append(
             f'{path}: ELF{32 * info["class"]} '
             f'{"LSB" if info["order"] == 1 else "MSB"} '

@@ -14,7 +14,7 @@ import yaml
 REQUIRED = {
     'odac-opennds': {
         'etc/init.d/opennds', 'etc/config/opennds',
-        'usr/bin/opennds', 'usr/bin/ndsctl',
+        'usr/libexec/odac-opennds-check', 'usr/bin/opennds', 'usr/bin/ndsctl',
     },
     'device-access': {
         'etc/init.d/odac', 'etc/config/odac', 'usr/sbin/odacd',
@@ -36,7 +36,8 @@ REQUIRED = {
 # default configuration must fail even when it has the expected file name.
 PINNED = {
     'odac-opennds': {'etc/init.d/opennds': 0o755,
-                     'etc/config/opennds': 0o600},
+                     'etc/config/opennds': 0o600,
+                     'usr/libexec/odac-opennds-check': 0o755},
     'device-access': {'etc/init.d/odac': 0o755,
                       'etc/config/odac': 0o644},
 }
@@ -94,6 +95,11 @@ def check(package, text, source_root):
         return [f'unsupported package: {package}']
     name, files = parse_dump(text)
     failures = []
+    if package == 'device-access':
+        data = yaml.load(text, Loader=yaml.BaseLoader)
+        depends = data['info'].get('depends', [])
+        if not isinstance(depends, list) or 'odac-opennds>=10.3.1-r2' not in depends:
+            failures.append('device-access must require odac-opennds>=10.3.1-r2')
     if name != package:
         failures.append(f'package name {name!r} does not match {package!r}')
     for path in sorted(REQUIRED[package]):

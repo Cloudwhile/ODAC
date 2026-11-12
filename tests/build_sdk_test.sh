@@ -213,8 +213,8 @@ case "$1" in
 		# goal produces through its dependencies.
 		echo "$*" >> "${MAKE_LOG}"
 		mkdir -p bin/packages/x86_64/base
-		for package in libargon2-20190702-r1 odac-opennds-10.3.1-r1 \
-			device-access-0.1.0-r1 luci-app-device-access-0.1.0-r1
+		for package in libargon2-20190702-r1 odac-opennds-10.3.1-r2 \
+			device-access-0.1.0_rc1-r3 luci-app-device-access-0.1.0_rc1-r1
 		do
 			file="bin/packages/x86_64/base/${package}.apk"
 			case "$package" in

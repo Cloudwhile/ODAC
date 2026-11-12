@@ -23,6 +23,14 @@ service_data() {
 }
 
 odac_admission_ready() {
+	[ -x /usr/libexec/odac-opennds-check ] || {
+		logger -t odac-opennds 'not started: DNS isolation check is missing'
+		return 1
+	}
+	/usr/libexec/odac-opennds-check || {
+		logger -t odac-opennds 'not started: openNDS configuration requires shared DNS changes'
+		return 1
+	}
 	[ "$(uci -q get opennds.@opennds[0].odac_backend)" = 1 ] || return 1
 	[ "$(uci -q get opennds.@opennds[0].enabled)" = 1 ] || return 1
 	[ "$(uci -q get odac.main.enabled)" = 1 ] || return 1

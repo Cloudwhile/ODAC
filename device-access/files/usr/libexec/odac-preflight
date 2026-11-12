@@ -213,6 +213,10 @@ apk info -e odac-opennds >/dev/null 2>&1 ||
 	fail '/etc/config/opennds does not belong to the odac-opennds backend'
 grep -q 'odac_admission_ready' /etc/init.d/opennds ||
 	fail '/etc/init.d/opennds is not the gated odac-opennds service'
+[ -x /usr/libexec/odac-opennds-check ] ||
+	fail 'The openNDS shared-DNS isolation checker is missing; reinstall odac-opennds'
+/usr/libexec/odac-opennds-check ||
+	fail 'openNDS configuration requires shared DNS/DHCP changes unsupported by ODAC'
 # Do not coexist with bypass grants from another openNDS policy.
 for option in trustedmac preemptivemac; do
  [ -z "$(uci -q get opennds.@opennds[0].$option || true)" ] || fail "Existing openNDS $option bypasses ODAC policy"

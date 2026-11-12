@@ -141,6 +141,20 @@ class ElfTest(unittest.TestCase):
         self.assertTrue(self.run_check(binary, 'noarch'))
         self.assertTrue(self.run_check(binary, 'riscv64'))
 
+    def test_opennds_must_include_dns_isolation_and_no_shared_dns_calls(self):
+        binary = make_elf(True, True, 62, MUSL)
+        marker = b'/usr/libexec/odac-opennds-check\0'
+        self.assertTrue(any('missing ODAC DNS isolation' in error for error in
+                            self.run_check([('usr/bin/opennds', binary)], 'x86_64')))
+        self.assertEqual(self.run_check(
+            [('usr/bin/opennds', binary + marker)], 'x86_64'), [])
+        for forbidden in (b'/usr/lib/opennds/dnsconfig.sh',
+                          b'/usr/lib/opennds/libopennds.sh nftset'):
+            with self.subTest(command=forbidden):
+                self.assertTrue(any('shared DNS lifecycle command' in error for error in
+                                    self.run_check([('usr/bin/opennds', binary + marker + forbidden)],
+                                                   'x86_64')))
+
     def test_payload_must_match_the_listing(self):
         files = [('usr/bin/tool', make_elf(True, True, 62, MUSL))]
         for options in ({'corrupt': 'tool'}, {'drop': 'tool'},

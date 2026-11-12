@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=device-access
 PKG_VERSION:=0.1.0_rc1
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=GPL-2.0-only
 PKG_BUILD_PARALLEL:=1
 
@@ -37,11 +37,13 @@ define Package/device-access
 	# Admission: odac-opennds, not the stock opennds. The stock package is
 	# started by its own postinst before any ODAC script can run, and its
 	# init script changes network.wan6 and may capture br-lan. odac-opennds
-	# is the same pinned openNDS release with a gated init script, so this
-	# dependency installs inert. It ships the same files as stock opennds,
+	# uses the pinned release with gated startup and shared-DNS isolation.
+	# It installs inert and ships the stock binary paths,
 	# so it cannot silently replace an existing instance; preflight refuses
 	# a stock opennds as well.
 	DEPENDS:=+libsqlite3 +libjson-c +libargon2 +ca-bundle +uhttpd +odac-opennds +firewall4 +nftables-json +conntrack +rpcd +uci +ubus +jshn +jsonfilter +curl +openssl-util
+	# Keep build selection above; enforce the DNS-isolated backend at install time.
+	EXTRA_DEPENDS:=odac-opennds (>=10.3.1-r2)
 endef
 
 define Package/device-access/description

@@ -2,6 +2,8 @@ include $(TOPDIR)/rules.mk
 
 # ODAC admission backend: the pinned upstream openNDS release, packaged with a
 # gated init script and without the stock install-time network changes.
+# patches/100-isolate-shared-dns.patch removes daemon DNS/DHCP lifecycle
+# actions; odac-opennds-check rejects configurations needing those features.
 #
 # The stock routing/opennds 10.3.1-r2 recipe starts its init script from the
 # package postinst. That start_service has no "enabled" check and always runs
@@ -10,7 +12,7 @@ include $(TOPDIR)/rules.mk
 # Neither can be suppressed by configuration, so ODAC cannot depend on it.
 PKG_NAME:=odac-opennds
 PKG_VERSION:=10.3.1
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 # Same source archive and hash as the official feed recipe.
 PKG_SOURCE:=opennds-$(PKG_VERSION).tar.gz
@@ -53,7 +55,8 @@ endef
 
 define Package/odac-opennds/install
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/lib/opennds $(1)/etc/opennds/htdocs/images
-	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d $(1)/usr/libexec
+	$(INSTALL_BIN) ./files/usr/libexec/odac-opennds-check $(1)/usr/libexec/odac-opennds-check
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/opennds $(1)/usr/bin/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ndsctl $(1)/usr/bin/
 	$(CP) $(PKG_BUILD_DIR)/resources/splash.css $(1)/etc/opennds/htdocs/
