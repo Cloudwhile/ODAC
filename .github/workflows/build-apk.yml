@@ -393,7 +393,11 @@ jobs:
             # The declared arch is metadata. Read the payload itself: every
             # file must match its listed hash, and the ELF headers, loader
             # and SONAME must match the target.
+            # Preserve the exact rejected input for diagnosis if validation fails.
+            # This is an unverified diagnostic, never a release artifact.
+            cp "$found" "diagnostics/unverified-${pkg}.apk"
             python3 -I scripts/check-apk-elf.py "$found" "$dump" "$expected"
+            rm "diagnostics/unverified-${pkg}.apk"
             cp "${found}" "dist/${pkg}-${version}-${target}-${subtarget}.apk"
           done
 
