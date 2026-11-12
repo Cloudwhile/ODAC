@@ -28,9 +28,10 @@
 | 真实 LuCI 主题下的管理页渲染 | 静态资源与菜单/ACL 已验证，浏览器内渲染**未验证** |
 | 限速精度、CPU/内存、并发吞吐、Flow Offloading 影响 | **未测量** |
 | Cudy TR3000 实体机部署与回滚 | **未完成**（无实体设备，不以生产机替代测试） |
-| CI 优化前后耗时对比 | **未完成同条件对比**；成功构建 `10726da` 的 SDK 构建阶段 2403 s（feeds 77、配置 2、Argon2 6、准入 1095、后端 988、LuCI 235），含依赖编译与打包。相同步骤的另外两次为 2486 s（SDK 与源码缓存命中）和 3105 s，缓存不缩短编译，Runner 波动大。日志显示构建串行（子 make 全为 `-j1`），内核模块打包在三次调用中各重做一遍，GnuTLS 完整编译两次（见[根因分析](root-cause.md)）。改为一次并行 `make`（`435a76e`，[43209085571](https://github.com/Cloudwhile/ODAC/actions/runs/43209085571)，4 任务，缓存未命中）后同一脚本全程 1205 s，编译与打包阶段 1122 s，内核模块打包与 GnuTLS 各执行一次，四个 APK 与串行构建逐字节一致。并行构建**只有一次样本**，不给出稳定的提速比例 |
+| CI 优化前后耗时对比 | **未完成同条件对比**；成功构建 `10726da` 的 SDK 构建阶段 2403 s（feeds 77、配置 2、Argon2 6、准入 1095、后端 988、LuCI 235），含依赖编译与打包。相同步骤的另外两次为 2486 s（SDK 与源码缓存命中）和 3105 s，缓存不缩短编译，Runner 波动大。日志显示构建串行（子 make 全为 `-j1`），内核模块打包在三次调用中各重做一遍，GnuTLS 完整编译两次（见[根因分析](root-cause.md)）。改为一次并行 `make`（`435a76e`，[43209085571](https://github.com/Cloudwhile/ODAC/actions/runs/43209085571)，4 任务，缓存未命中）后 x86/64 三次运行的脚本全程为 1205 / 964 / 1340 s，内核模块打包与 GnuTLS 各执行一次，四个 APK 与串行构建逐字节一致。三次都短于最快的串行运行，但 Runner 波动大，不给出稳定的提速比例 |
 | APK 文件树与门控源文件元数据 | `90ac2ea` 的检查器对上述历史四包清单通过；9 项回归测试通过。核对 init/默认配置的 SHA256、权限及归属，不等于签名、ELF ABI 或实际安装验证 |
-| APK 载荷与 ELF（`scripts/check-apk-elf.py`） | CI 43186925580 在收集步骤对四个 x86/64 APK 执行并通过（本地对前两次产物复核结果相同）：每个文件的内容与清单 SHA256 一致；6 个 ELF 均为 ELF64 LSB x86-64，可执行文件使用 `/lib/ld-musl-x86_64.so.1`；Argon2 库的 SONAME 与文件名一致，`odacd` 的 NEEDED 含该 SONAME；LuCI 包不含 ELF。7 项回归测试通过。动态库能否在设备上解析属于安装验收，**未验证**；其余 10 个 target 的产物**未检查** |
+| APK 载荷与 ELF（`scripts/check-apk-elf.py`） | CI 43186925580 在收集步骤对四个 x86/64 APK 执行并通过（本地对前两次产物复核结果相同）：每个文件的内容与清单 SHA256 一致；6 个 ELF 均为 ELF64 LSB x86-64，可执行文件使用 `/lib/ld-musl-x86_64.so.1`；Argon2 库的 SONAME 与文件名一致，`odacd` 的 NEEDED 含该 SONAME；LuCI 包不含 ELF。7 项回归测试通过。动态库能否在设备上解析属于安装验收，**未验证** |
+| 11 个 target 的构建与 APK 检查 | 手动全矩阵运行 [43214081475](https://github.com/Cloudwhile/ODAC/actions/runs/43214081475)（`8900f71`，非 Tag，发布 Job 按设计跳过）全部成功。下载各 target 产物本地复核：校验和、内容检查、载荷哈希与 ELF 检查全部通过，每个 target 4 个 APK、6 个 ELF。ELF 头与加载器按架构为：x86_64 ELF64 LSB `ld-musl-x86_64`；5 个 aarch64 target ELF64 LSB `ld-musl-aarch64`；3 个 arm target ELF32 LSB `ld-musl-armhf`；mipsel ELF32 LSB `ld-musl-mipsel-sf`；mips ELF32 MSB `ld-musl-mips-sf`。LuCI 包在 11 个 target 上逐字节相同。这是构建产物检查，**没有任何一个 target 做过安装或运行验证** |
 | 新包签名与真实安装 | **阻塞**：CI 产物未签名；VM apk 是 minimal 构建，不含 adbsign。本地官方 SDK 预编译签名工具的执行被自动审批拒绝，未改用免签参数；需要明确授权后才能执行该工具。测试签名不得当作正式发布签名。当前 VM 备份写入与 apk update 也被自动审批拒绝，尚未执行 |
 
 未验证项意味着不能据此声称「已在真实设备上可用」。
