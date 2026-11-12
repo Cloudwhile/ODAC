@@ -198,7 +198,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bzip2 build-essential cpio diffstat file g++ gawk git \
-            libelf-dev libncurses-dev libssl-dev patch perl python3 \
+            libelf-dev libncurses-dev libssl-dev patch perl python3 python3-yaml \
             python3-setuptools rsync time unzip wget xz-utils zlib1g-dev zstd
           echo "host_seconds=$((SECONDS - start))" >> "$GITHUB_ENV"
 
@@ -377,24 +377,12 @@ jobs:
               exit 1
             fi
             echo "${pkg}: arch=${declared} version=${version}"
+            # adbdump lists directories and file names separately. Validate
+            # the tree, including pinned init/config hashes, for all four APKs.
+            dump="diagnostics/${pkg}.dump"
+            "${apk_bin}" adbdump "$found" > "$dump"
+            python3 -I scripts/check-apk-content.py "$dump" "$pkg"
             cp "${found}" "dist/${pkg}-${version}-${target}-${subtarget}.apk"
-          done
-
-          # Verify critical content constraints: odac-opennds must not ship
-          # uci-defaults or restart.sh; device-access must depend on odac-opennds.
-          echo "Checking APK file content:"
-          for apk in dist/odac-opennds*.apk; do
-            dump=$("${apk_bin}" adbdump "$apk")
-            if printf '%s\n' "$dump" | grep -qE 'etc/uci-defaults|restart\.sh'; then
-              echo "ERROR: odac-opennds must not ship uci-defaults or restart.sh" >&2
-              printf '%s\n' "$dump" | grep -E 'uci-defaults|restart\.sh' >&2
-              exit 1
-            fi
-            if ! printf '%s\n' "$dump" | grep -q 'etc/init\.d/opennds'; then
-              echo "ERROR: odac-opennds must ship etc/init.d/opennds (gated init)" >&2
-              exit 1
-            fi
-            echo "odac-opennds: content OK (no uci-defaults/restart.sh, gated init present)"
           done
 
           (cd dist && sha256sum ./*.apk > SHA256SUMS)

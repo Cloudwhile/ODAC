@@ -111,6 +111,9 @@ else
 	fail 'PyYAML is required for the workflow check'
 fi
 
+stage 'APK content checker regression tests'
+python3 -I tests/apk_content_test.py || fail 'APK content checker tests failed'
+
 # --- 6. build scope resolution ------------------------------------------------
 
 stage 'Build scope resolution'
