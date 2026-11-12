@@ -287,10 +287,12 @@ CI 的完整说明（SDK 校验、APK 元数据校验、Release 保护、缓存�
 - `odac-opennds` 的 init 脚本不调用 `ipv6_routing`，因此启用 ODAC 不再把
   `network.wan6.proto` 改成 `none`；但 openNDS 守护进程在新选项
   （`users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0`）
-  下的实际行为**尚未在虚拟机或路由器上验证**。
+  下已做 VM 诊断观察：规则仅引用受控接口，WAN6 不变；共享 dnsmasq 仍被重启，
+  其影响与真实客户端准入尚待验证。
 - 受控客户端只能访问门户端口，不能直连路由器的 SSH/LuCI，这是设计意图。
 - 真实路由器上的安装、验收与性能**尚未验证**。整改后的四个包已由 CI 构建，并在
-  x86/64 测试虚拟机上完成安装、默认状态检查、卸载和重新安装；真正启用准入、升级和
+  x86/64 测试虚拟机上完成安装、默认状态检查、卸载和重新安装。r1 启用暴露
+  openNDS 就绪竞态，r2 已加入有限重试与回滚测试，修复包的启用验收待执行；升级和
   干净镜像首次安装**未完成**，Cudy TR3000 实体机验证**未完成**。CI 产物不带签名，
   发布签名方案尚未实现。详见 `docs/deployment.md` 的「已验证与未验证」表，根因分析见
   `docs/root-cause.md`。
