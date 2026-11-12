@@ -20,15 +20,17 @@
 | 构建范围解析（矩阵内容） | 通过（12 项，`tests/scope_test.sh`） |
 | 11 个架构的 `arch` 与官方 `profiles.json` 一致 | 逐项核对通过 |
 | 11 个目标均有官方 SDK 归档且归档名正则匹配 | 逐项核对通过 |
-| 真实 SDK 构建与 APK 产出（含 `odac-opennds` 的 autoreconf 与链接） | **未执行**（执行下载的 SDK 二进制被环境自动审批拒绝，需显式授权） |
+| 真实 SDK 构建与 APK 产出（含 `odac-opennds` 的 autoreconf 与链接） | 提交 `10726da` 的 [x86/64 CI 43154130757](https://github.com/Cloudwhile/ODAC/actions/runs/43154130757) 成功产出四包；`d7b95ec` 的构建成功但内容收集误判失败；修复提交 `90ac2ea` 的 CI 结果待确认。本地 SDK 编译按要求跳过 |
 | 官方 `opennds` 与 `odac-opennds` 同时安装时 apk 是否因文件冲突拒绝 | **未验证**（APK 不携带 `CONFLICTS`；由 preflight 拒绝兜底） |
 | openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | **未验证** |
 | 真实路由器安装/升级/停用/卸载 | **未验证** |
-| OpenWrt 25.12.2 x86/64 测试虚拟机 | 早期版本曾实测：三个 APK（当时依赖官方 opennds）离线安装、默认不启用、预检通过、`odac-setup --enable` 接管成功、门户 HTTP→HTTPS 跳转与 HTTPS 服务可用、rpcd→ubus 管理链路返回真实数据、管理 SSH 未被阻断。**本次整改后的代码尚未在该虚拟机上复测。** 不等同生产路由器验收 |
+| OpenWrt 25.12.2 x86/64 测试虚拟机 | 2026-11-12 复查现有 VM：新四包未安装；SSH、LuCI 登录后的状态页、外网可达，libustream 提供者与文件存在。此前清理删除了旧 ODAC 数据且无已验证备份，运行时仍有 br-odac；不是干净镜像基线。**新包安装、升级、停用、卸载与恢复验收未完成** |
 | 真实 LuCI 主题下的管理页渲染 | 静态资源与菜单/ACL 已验证，浏览器内渲染**未验证** |
 | 限速精度、CPU/内存、并发吞吐、Flow Offloading 影响 | **未测量** |
 | Cudy TR3000 实体机部署与回滚 | **未完成**（无实体设备，不以生产机替代测试） |
-| CI 优化前后耗时对比 | **未测量**（需在 Actions 上跑相同条件；不填写估计值） |
+| CI 优化前后耗时对比 | **未完成同条件对比**；成功构建 `10726da` 的 SDK 构建阶段 2403 s（feeds 77、配置 2、Argon2 6、准入 1095、后端 988、LuCI 235），含依赖编译与打包。另一次缓存命中构建为 2903 s，不能宣称热缓存使编译提速 |
+| APK 文件树与门控源文件元数据 | `90ac2ea` 的检查器对上述历史四包清单通过；9 项回归测试通过。核对 init/默认配置的 SHA256、权限及归属，不等于签名、ELF ABI 或实际安装验证 |
+| 新包签名与真实安装 | **阻塞**：CI 产物未签名；VM apk 是 minimal 构建，不含 adbsign。本地官方 SDK 预编译签名工具的执行被自动审批拒绝，未改用免签参数；需要明确授权后才能执行该工具。测试签名不得当作正式发布签名。当前 VM 备份写入与 apk update 也被自动审批拒绝，尚未执行 |
 
 未验证项意味着不能据此声称「已在真实设备上可用」。
 
@@ -143,11 +145,11 @@ make package/odac/argon2/compile package/odac/odac-opennds/compile package/odac/
 
 ### 关于 gettext / gnulib
 
-`gettext-full/host` 与 `gnulib-l10n/host` 是 `opennds → libmicrohttpd →
-gnutls → gettext-full/host → gnulib-l10n/host` 这条**真实传递依赖**的一部分，
-**不是无用依赖**，不能删除来提速。基线构建中它们的耗时是
-`gettext-full/host-compile` 378.24 s、`libunistring/host-compile` 146.88 s。
-可行的优化是缓存复用，而不是砍掉依赖。详见 `docs/root-cause.md`。
+成功构建 `10726da` 的日志确认 gettext/gnulib 首次宿主编译发生在准入包阶段，
+GnuTLS 使用 gettext 的 autopoint；gettext 后续目标访问只需 0.35 s，
+并未重复完整编译。GnuTLS 第二次编译的触发原因、完整 Make 依赖边和跨 Job
+宿主缓存收益仍待验证。现有缓存仅覆盖 SDK 归档与下载源码；不能据此声称
+编译已显著提速，也不能删除依赖来让测试通过。详见 `docs/root-cause.md`。
 
 ## CI
 

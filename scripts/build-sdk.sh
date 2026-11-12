@@ -12,12 +12,11 @@
 #     exiting 0. The precise selection therefore has to use the documented
 #     syntax, and the result has to be verified afterwards.
 #
-#   * install_src() walks builddepends and builddepends/host itself, so the
-#     host tools a package needs are pulled in with it. Asking for
-#     "opennds" therefore also selects libmicrohttpd, and asking for
-#     "libmicrohttpd-ssl" also selects gnutls, which needs gettext-full/host
-#     and gnulib-l10n/host. Those host tools are genuinely required; they
-#     are not waste and they are not removed here.
+#   * install_src() walks source and host build dependencies, including other
+#     variants in a source recipe. Feed installation alone does not establish
+#     which variant causes compilation. CI shows GnuTLS using host gettext's
+#     autopoint; the exact generated dependency edges and repeated GnuTLS
+#     build still need tracing (docs/root-cause.md). Keep dependencies intact.
 #
 #   * The SDK ships no .config. A minimal configuration is written first and
 #     then completed by "make defconfig", which is the only way to get a

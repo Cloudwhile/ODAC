@@ -222,12 +222,12 @@ scripts/build-sdk.sh /path/to/sdk/mediatek-filogic-gcc-14.3.0_musl.Linux-x86_64 
 4. 在 `defconfig` 之后**校验**四个包和它们的运行依赖确实被选中，
    并确认 `CONFIG_ALL` 仍然是关闭的、官方 `opennds` 没有被选中。
 
-依赖会由 feeds 工具自行递归解析：`odac-opennds` 依赖 `libmicrohttpd-no-ssl`；
-feeds 按**源码包**安装，`libmicrohttpd` 源码包同时含 ssl 变体，
-`libmicrohttpd-ssl` 拉入 `gnutls`，而 `gnutls` 需要 `gettext-full/host`，
-后者需要 `gnulib-l10n/host`、`gperf/host`、`libiconv-full/host`、
-`libunistring/host` 与 `libxml2/host`。**这些宿主工具是真实需要的**，
-不能通过删除依赖来缩短构建时间，只能靠缓存复用。
+依赖由 feeds 工具递归解析，SDK 会聚合同一源码包各变体的依赖。
+CI 日志确认：gettext/gnulib 的首次宿主编译出现在 `odac-opennds` 编译阶段，
+GnuTLS 配置实际使用 gettext 提供的 autopoint；libmicrohttpd-no-ssl 则明确
+使用 `--without-gnutls`。完整的源码包依赖边和 GnuTLS 重编译原因仍需生成的
+Make 依赖图补证，不能由 feeds 安装记录推断运行时依赖或直接删除依赖。
+证据与未完成项见 [根因分析](docs/root-cause.md)。
 
 本机可运行（Linux 主机，无需路由器；需要 json-c、SQLite 与 Argon2 的开发头文件和库）：
 

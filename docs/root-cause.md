@@ -264,9 +264,31 @@ DEPENDS:=+libmicrohttpd-no-ssl
 
 ### 结论
 
-`gettext-full/host` → `gnulib-l10n/host` 的链路是
-`opennds → libmicrohttpd → gnutls → gettext-full/host → gnulib-l10n/host`
-的真实传递依赖。**它们不是无用依赖**，不能通过删除来提速。
+上述配方指向候选链路 `opennds → libmicrohttpd 源码包 → gnutls →
+gettext-full/host → gnulib-l10n/host`，但尚缺该次构建的生成依赖图与
+Make prerequisite trace，不能把每一条边都视为已证实。SDK 的 feeds 工具会安装
+同一源码包各变体的依赖，package-metadata.pl 也会聚合源码包的编译依赖；
+配方被安装并不等于它必然被编译，更不等于 no-ssl 变体运行时链接 GnuTLS。
+
+后续成功构建 [run 43154130757](https://github.com/Cloudwhile/ODAC/actions/runs/43154130757)
+（提交 `10726da`）的 `sdk-build.log` 提供了以下直接证据：
+
+- 首次 gettext/gnulib 宿主编译出现在 `package/odac/odac-opennds/compile`
+  调用范围内（日志 2873–90323 行）；GnuTLS 配置实际调用
+  `staging_dir/hostpkg/bin/autopoint --force`（82773 行），该工具由 gettext
+  安装（78009 行）。这是已确认的宿主工具消费关系。
+- libmicrohttpd 的实际配置带 `--disable-https --without-gnutls`（89513 行）。
+  因此不能把所观察到的 GnuTLS 编译解释为 no-ssl 库的运行时链接需求。
+- `gnulib-l10n` 安装的是宿主本地化文件（48282–48320 行）；gettext 自身的
+  autogen 还会导入 gnulib 模块。这是两类不同工作。
+- gettext 首次耗时 301.92 s，后续两次目标访问均为 0.35 s；
+  gnulib-l10n 首次 2.64 s，后续均为 0.32 s，不能把重复目标名当作完整重编译。
+  GnuTLS 则确实又执行了一次配置/编译，耗时从首次 222.54 s 到第二次 221.41 s；
+  触发第二次构建的 stamp/依赖原因尚未确定。
+
+当前已缓存 SDK 归档和下载源码，尚未验证跨 Job 的宿主编译产物复用。
+构建产物没有保存 `.config` 前后差异和生成的 `.packagedeps`，完整因果链、
+预编译 host 工具清单及同条件冷/热缓存收益仍待补证。不得直接删除依赖来提速。
 
 基线日志中的耗时（来自 `time: package/.../compile#用户#系统#总计`）：
 
