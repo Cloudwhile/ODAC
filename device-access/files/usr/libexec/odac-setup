@@ -353,7 +353,15 @@ configured=$(openssl x509 -in "$cert" -noout -fingerprint -sha256)
 curl --fail --silent --show-error --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 20 --max-time 10 --noproxy '*' \
  --cacert "$cert" --resolve "$host:$https:$gateway" "https://$host:$https/" >/dev/null 2>&1 \
  || { echo 'Portal HTTPS request failed; the portal is not usable over TLS' >&2; exit 1; }
-ndsctl json >/dev/null
+# procd start returns before openNDS has opened its control socket.
+# Retry startup failures with a fixed limit; retain probe errors for diagnosis.
+nds_attempts=0
+until ndsctl json >/dev/null; do
+	nds_attempts=$((nds_attempts + 1))
+	[ "$nds_attempts" -lt 30 ] ||
+		{ echo "openNDS did not answer after 30 control-socket probes; check that $iface has link" >&2; exit 1; }
+	sleep 1
+done
 nft list table inet odac_guard >/dev/null
 
 # The management plane must still be reachable and unaffected. openNDS

@@ -13,7 +13,7 @@
 | 核心账号、审批、会话、设备策略、备份恢复 | 本机 CTest 通过（`core` 与 `boundary` 两个测试，boundary 20.69 s） |
 | nftables 守卫、授权撤销、IPv6 拒绝、租约过期、fw4 表重载 | 隔离网络命名空间测试通过（56 项） |
 | 生命周期脚本（归属记录、停用、卸载、恢复网络、清理、`odac-opennds` 门控 init） | 宿主隔离测试通过（256 项，`tests/lifecycle_test.sh`，需 root） |
-| 启用事务（所有权先记录、回滚、WAN6 核对、拒绝中断/未登记状态） | 宿主沙箱测试通过（8 项，`scripts/test-deployment.py`），5 个故意注入的缺陷均被检出 |
+| 启用事务（所有权先记录、回滚、WAN6 核对、拒绝中断/未登记状态） | 宿主沙箱测试通过（10 项，`scripts/test-deployment.py`，含 openNDS 延迟就绪及始终未就绪回滚），5 个故意注入的缺陷均被检出 |
 | 构建脚本单元测试（feeds 选择、Kconfig、版本与 target 校验、拒绝官方 opennds） | 桩测试通过（15 项） |
 | workflow 结构校验 + shell 语法检查 | 通过（`tests/workflow_check.py`，11 个目标） |
 | workflow 变异回归 + 校验和夹具 | 通过（4 项，`tests/workflow_negative_test.sh`） |
@@ -22,7 +22,8 @@
 | 11 个目标均有官方 SDK 归档且归档名正则匹配 | 逐项核对通过 |
 | 真实 SDK 构建与 APK 产出（含 `odac-opennds` 的 autoreconf 与链接） | 提交 `10726da` 的 [x86/64 CI 43154130757](https://github.com/Cloudwhile/ODAC/actions/runs/43154130757) 成功产出四包；`d7b95ec` 的构建成功但内容收集误判失败；修复提交 `90ac2ea`（[43180259567](https://github.com/Cloudwhile/ODAC/actions/runs/43180259567)）与 `c98f0f7`（[43186925580](https://github.com/Cloudwhile/ODAC/actions/runs/43186925580)）均成功，三次构建的四个 APK 逐字节一致。本地 SDK 编译按要求跳过 |
 | 官方 `opennds` 与 `odac-opennds` 同时安装时 apk 是否因文件冲突拒绝 | **未验证**。在已装 `odac-opennds` 的 VM 上 `apk add --simulate opennds` 求解通过，说明元数据层面不冲突；模拟不检查文件冲突，真实事务没有执行（官方包的 postinst 可能接管管理 LAN）。由 preflight 拒绝兜底 |
-| openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | **未验证** |
+| openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | VM 上通过临时诊断脚本启用后，nds 规则仅引用 `br-odac`，没有 `firewall.opennds`、WAN6 或 DHCP 配置改动；管理面检查通过。但 openNDS 启停仍重启共享 dnsmasq，日志报 reload/restart failed，影响待查；没有真实受控客户端，不构成准入验收 |
+| VM 启用、回滚与停用 | r1 原版启用两次在单次 `ndsctl json` 检查处退出 3 并回滚，守卫保持关闭、管理配置不变。无端口的桥虽通过 preflight，openNDS 因无链路无法启动；从官方源安装 kmod-dummy 并仅在运行时将 dummy0 接入 br-odac 后，临时诊断脚本等待 4 秒即启用成功。诊断期间门户 HTTPS 200、管理面检查通过；原版 `--disable` 退出 0，数据库保留、退役守卫加载，openNDS 数秒后退出，随后管理面检查通过。**诊断脚本成功不等于原版启用通过**。r2 改为最多 30 次就绪检查，失败仍回滚；新包 VM 验收待执行 |
 | 真实路由器安装/升级/停用/卸载 | **未验证** |
 | OpenWrt 25.12.2 x86/64 测试虚拟机（**不是干净镜像**） | 2026-11-12 用测试签名包实测。首次安装后和重新安装后各做一次管理面检查（新建 SSH、LuCI HTTP 与 HTTPS、LuCI 登录、HTTPS `apk update`、外网），全部通过；卸载后在 VM 上检查了 HTTPS `apk update` 和外网，没有检查 LuCI。**安装**：四个文件经 `apk --keys-dir` 验签后安装，未用 `--allow-untrusted`；安装后 `odac.main.enabled=0`，openNDS 为 `enabled 0`、`gatewayinterface odac-unconfigured`，`opennds` 与 `odacd` 未运行，nft 仍只有 `inet fw4`，network、firewall、dhcp、uhttpd、dropbear 五个配置和 `/lib/libustream-ssl.so` 及其所有者不变，没有包被移除；系统日志有门控记录 `odac-opennds: not started`；`ldd` 对 `odacd`、`odacctl`、`opennds`、`ndsctl` 全部解析成功。**默认配置下启用**：`odac-setup --enable` 被 preflight 拒绝（退出 1），配置、规则集、文件、地址和进程都没有变化，没有生成 ownership，锁已释放；`--disable` 退出 0 且无变化；`--restore-network` 拒绝。**卸载**：`apk del` 四包退出 0，管理配置、TLS 提供者、nft 表和地址不变；未修改的 `/etc/config/odac`、`/etc/config/opennds` 与空的 `/etc/odac` 随包删除。**重新安装**：结果与首次相同。**未完成**：真正启用准入（需要受控网络和门户证书）、启用后的停用与回滚、带数据库的卸载保留、版本升级、干净镜像首次安装。VM 上有旧安装的残留（首次安装时 Argon2 库已存在并被同版本替换；`network.odac_device`、`dhcp.odac` 仍在） |
 | 真实 LuCI 主题下的管理页渲染 | 静态资源与菜单/ACL 已验证，浏览器内渲染**未验证** |

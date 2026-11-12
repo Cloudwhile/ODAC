@@ -56,6 +56,11 @@ case "$name" in
  odacctl) [ "$1" = --wait-ready ]; echo '{"ok":true,"data":{}}';;
  jsonfilter) echo true;;
  curl) [ "${FAIL_TLS:-0}" = 0 ] || exit 7;;
+ ndsctl)
+  # The first NDS_FAILURES probes fail like a daemon that is still starting.
+  if [ "${1:-}" = json ]; then
+   [ "$(grep -c '^ndsctl json' "$ROOT/events")" -gt "${NDS_FAILURES:-0}" ] || exit 3
+  fi;;
  fw4)
   if [ "$1" = check ] && [ "${FAIL_TLS:-0}" = 0 ]; then
    [ ! -e "$ROOT/etc/nftables.d/90-odac-retired.nft" ]
@@ -92,7 +97,8 @@ class Deployment(unittest.TestCase):
             target = root / 'usr/libexec' / name
             target.write_text(text)
             target.chmod(0o755)
-        for name in ('id', 'uci', 'openssl', 'jsonfilter', 'curl', 'fw4', 'ndsctl', 'nft'):
+        # "sleep" is stubbed too, so the bounded wait costs no real time.
+        for name in ('id', 'uci', 'openssl', 'jsonfilter', 'curl', 'fw4', 'ndsctl', 'nft', 'sleep'):
             (root / 'bin' / name).write_text(STUB)
             (root / 'bin' / name).chmod(0o755)
         for relative in ('usr/libexec/odac-preflight', 'usr/libexec/odac-firewall',
@@ -152,6 +158,21 @@ class Deployment(unittest.TestCase):
         self.assertIn('firewall_sha256_odac_guard ', state)
         self.assertNotIn('enable_pending', state)
         self.assertFalse(list((root / 'etc/odac').glob('*.before-enable')))
+
+    def test_enable_waits_for_the_opennds_control_socket(self):
+        # On the test VM openNDS answered four seconds after its start; a
+        # single immediate probe failed the activation and rolled it back.
+        result, root, events = self.enable(NDS_FAILURES=4)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events.count('ndsctl json\n'), 5)
+        self.assertEqual(events.count('sleep 1\n'), 4)
+        self.assertIn('odac_active 1', self.ownership(root))
+
+    def test_opennds_that_never_answers_is_rolled_back_after_a_bounded_wait(self):
+        result, root, events = self.enable(NDS_FAILURES=1000)
+        self.assertIn('did not answer after 30 control-socket probes', result.stderr)
+        self.assertEqual(events.count('ndsctl json\n'), 30)
+        self.assert_rolled_back(result, root, events)
 
     def test_tls_failure_restores_retired_guard_and_configuration(self):
         self.assert_rolled_back(*self.enable(FAIL_TLS=1))
