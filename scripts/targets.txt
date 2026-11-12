@@ -1,0 +1,25 @@
+# The architectures ODAC builds for, one per line:
+#
+#   <target> <subtarget> <arch>
+#
+# <target>/<subtarget> selects the OpenWrt SDK and the release download path,
+# <arch> is the ABI architecture the produced APKs declare.
+#
+# This list is the single source of truth. The build matrix, the release
+# completeness check and the workflow validation all read it, so they cannot
+# drift apart. Two targets may share an <arch> (bcm27xx/bcm2710 and
+# mediatek/filogic are both aarch64_cortex-a53); the file names of the
+# produced APKs carry the target, so the artifacts do not collide.
+#
+# The Cudy TR3000 is mediatek/filogic.
+x86 64 x86_64
+mediatek filogic aarch64_cortex-a53
+bcm27xx bcm2710 aarch64_cortex-a53
+mvebu cortexa72 aarch64_cortex-a72
+bcm27xx bcm2712 aarch64_cortex-a76
+armsr armv8 aarch64_generic
+armsr armv7 arm_cortex-a15_neon-vfpv4
+ipq40xx generic arm_cortex-a7_neon-vfpv4
+mvebu cortexa9 arm_cortex-a9_vfpv3-d16
+ramips mt7621 mipsel_24kc
+ath79 generic mips_24kc

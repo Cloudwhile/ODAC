@@ -6,158 +6,527 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_scope:
+        description: 'Build scope: "quick" builds x86_64 only, "full" builds every supported architecture'
+        type: choice
+        default: quick
+        options:
+          - quick
+          - full
 
+# Least privilege by default. The release job raises its own permission to
+# "contents: write" because it attaches the APKs to a GitHub Release. A pull
+# request never reaches that job and therefore never has Release write
+# access.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: build-apk-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request may be superseded by a newer commit, so cancelling the
+  # older run is correct and saves runner time. A release tag build must not
+  # be cancelled, because a half-finished release must never be published.
+  group: ${{ github.event_name == 'pull_request' && format('build-apk-pr-{0}', github.ref) || format('build-apk-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SDK_VERSION: "25.12.2"
-  SDK_GCC: "14.3.0"
 
 jobs:
-  build:
-    name: ${{ matrix.arch }}
+  # ---------------------------------------------------------------------------
+  # The build scope.
+  #
+  # The scope is resolved into an explicit matrix here, so a quick run really
+  # contains one architecture and a full run contains all of them. A step that
+  # only prints "skipping" would still run every later step, and the matrix
+  # would still be built for every architecture.
+  # ---------------------------------------------------------------------------
+  scope:
+    name: resolve the build scope
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: aarch64_cortex-a53
-            target: bcm27xx
-            subtarget: bcm2710
-          - arch: aarch64_cortex-a72
-            target: mvebu
-            subtarget: cortexa72
-          - arch: aarch64_cortex-a76
-            target: bcm27xx
-            subtarget: bcm2712
-          - arch: aarch64_generic
-            target: armsr
-            subtarget: armv8
-          - arch: arm_cortex-a15_neon-vfpv4
-            target: armsr
-            subtarget: armv7
-          - arch: arm_cortex-a7_neon-vfpv4
-            target: ipq40xx
-            subtarget: generic
-          - arch: arm_cortex-a9_vfpv3-d16
-            target: mvebu
-            subtarget: cortexa9
-          - arch: mipsel_24kc
-            target: ramips
-            subtarget: mt7621
-          - arch: mips_24kc
-            target: ath79
-            subtarget: generic
-          - arch: x86_64
-            target: x86
-            subtarget: "64"
+    timeout-minutes: 10
+    outputs:
+      scope: ${{ steps.resolve.outputs.scope }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check SDK validation
-        run: sh tests/build_sdk_test.sh
+      - name: Resolve the matrix
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DISPATCH_SCOPE: ${{ inputs.build_scope }}
+        run: |
+          set -euo pipefail
+          # The list of supported architectures is a single file, shared with
+          # the release completeness check and with the workflow validation,
+          # so the three cannot drift apart.
+          resolved=$(sh scripts/resolve-scope.sh "${EVENT_NAME}" "${REF_TYPE}" "${DISPATCH_SCOPE:-quick}")
+          echo "$resolved"
+          scope=$(printf '%s\n' "$resolved" | sed -n 's/^scope=//p')
+          matrix=$(printf '%s\n' "$resolved" | sed -n 's/^matrix=//p')
+          count=$(printf '%s\n' "$resolved" | sed -n 's/^count=//p')
+          {
+            echo "scope=${scope}"
+            echo "matrix=${matrix}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Build scope: ${scope} (${count} architecture(s))"
+          {
+            echo "### Build scope"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger | ${EVENT_NAME} |"
+            echo "| Ref | ${GITHUB_REF} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+            echo "| Scope | ${scope} |"
+            echo "| Architectures | ${count} |"
+            echo ""
+            echo "| Target | Subtarget | Architecture |"
+            echo "|---|---|---|"
+            grep -vE '^\s*(#|$)' scripts/targets.txt | while read -r target subtarget arch; do
+              [ -n "$target" ] || continue
+              if [ "$scope" = quick ] && [ "$target" != x86 ]; then continue; fi
+              echo "| ${target} | ${subtarget} | ${arch} |"
+            done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Fast verification. This job downloads no SDK and builds nothing for the
+  # target. It compiles the portable sources with the host toolchain, runs
+  # CTest, and runs the build-script and lifecycle regression suites.
+  #
+  # Every APK build job depends on it, so a broken core, a broken JSON
+  # boundary or a broken shell script stops the pipeline before a single SDK
+  # is downloaded.
+  # ---------------------------------------------------------------------------
+  fast-check:
+    name: fast verification
+    needs: scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the host tools the fast check needs
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libjson-c-dev libsqlite3-dev libargon2-dev \
+            pkg-config iproute2 nftables python3-yaml
+
+      - name: Run the fast checks
+        run: |
+          set -euo pipefail
+          # The suite needs root for the lifecycle tests; the platform tests
+          # need unprivileged user namespaces, which the runner provides.
+          sudo --preserve-env=PATH sh scripts/fast-check.sh
+
+      - name: Upload the fast check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-check-log
+          path: build-fast/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The architecture matrix.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.target }}-${{ matrix.subtarget }}
+    needs: [scope, fast-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      # One architecture failing must not cancel the others: a partial matrix
+      # is published only after the release job verifies that every required
+      # architecture produced a complete APK set.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
+    env:
+      # The target of this matrix entry, available to every step. The steps
+      # read these from the environment instead of expanding the matrix
+      # context inline, so that a step never depends on a context that is
+      # only valid in some of them.
+      TARGET: ${{ matrix.target }}
+      SUBTARGET: ${{ matrix.subtarget }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the build scope
+        env:
+          SCOPE: ${{ needs.scope.outputs.scope }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${{ matrix.target }}-${{ matrix.subtarget }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger | ${GITHUB_EVENT_NAME} |"
+            echo "| Scope | ${SCOPE} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Free disk space
         run: |
+          set -euo pipefail
+          # Remove tool caches that the SDK build does not use. Only the
+          # runner image is touched, never a build input.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL
           sudo apt-get clean
           df -h /
 
-      - name: Install host dependencies
+      - name: Install the host dependencies the SDK needs
         run: |
+          set -euo pipefail
+          start=$SECONDS
+          # Install the host prerequisites explicitly; versions are supplied
+          # by the runner's configured Ubuntu repositories.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bzip2 build-essential cpio diffstat file g++ gawk gettext git \
+            bc bzip2 build-essential cpio diffstat file g++ gawk git \
             libelf-dev libncurses-dev libssl-dev patch perl python3 \
             python3-setuptools rsync time unzip wget xz-utils zlib1g-dev zstd
+          echo "host_seconds=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: Restore the cached SDK archive
+        id: cache_sdk
+        uses: actions/cache/restore@v4
+        with:
+          # The key pins the SDK version, the target and the architecture, so
+          # an archive is never reused for a different target.
+          key: sdk-${{ env.SDK_VERSION }}-${{ matrix.target }}-${{ matrix.subtarget }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-sdk.sh') }}
+          path: sdk-cache
 
       - name: Download and verify the SDK
+        id: sdk
         run: |
           set -euo pipefail
-          base="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
-          curl -fsSLO "${base}/sha256sums"
-          # The libc suffix in the archive name is musl for most targets and
-          # musl_eabi for the 32-bit ARM and mips ones, so read the name from
-          # the release manifest instead of guessing it.
-          archive=$(grep -oE "openwrt-sdk-${SDK_VERSION}-${{ matrix.target }}-${{ matrix.subtarget }}_gcc-[^ ]+_musl[^ ]*\.Linux-x86_64\.tar\.zst" sha256sums | head -1)
-          [ -n "$archive" ] || { echo "no SDK archive listed for ${{ matrix.target }}/${{ matrix.subtarget }}"; exit 1; }
-          curl -fsSLO "${base}/${archive}"
-          grep -F "${archive}" sha256sums | sha256sum -c -
-          tar --zstd -xf "${archive}"
-          echo "SDK_DIR=${PWD}/${archive%.tar.zst}" >> "$GITHUB_ENV"
-          df -h /
+          base="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${TARGET}/${SUBTARGET}"
+          start=$SECONDS
+          mkdir -p sdk-cache
+          curl -fsSL -o sdk-cache/sha256sums "${base}/sha256sums"
+          archive=$(python3 scripts/verify-sdk.py sdk-cache/sha256sums "${SDK_VERSION}" "${TARGET}" "${SUBTARGET}")
+          if [ ! -f "sdk-cache/${archive}" ]; then
+            curl -fsSL -o "sdk-cache/${archive}" "${base}/${archive}"
+          fi
+          # Require a unique manifest entry and compare the archive digest,
+          # including on cache hits. Selection and verification use the same
+          # freshly downloaded HTTPS manifest.
+          python3 scripts/verify-sdk.py sdk-cache/sha256sums "${SDK_VERSION}" "${TARGET}" "${SUBTARGET}" --archive "sdk-cache/${archive}"
+          echo "download_seconds=$((SECONDS - start))" >> "$GITHUB_ENV"
+          echo "SDK archive verified against the official manifest."
+
+          size=$(stat -c%s "sdk-cache/${archive}")
+          echo "sdk_archive=${archive}" >> "$GITHUB_ENV"
+          echo "sdk_bytes=${size}" >> "$GITHUB_ENV"
+
+      - name: Save the SDK archive to the cache
+        if: steps.cache_sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: sdk-${{ env.SDK_VERSION }}-${{ matrix.target }}-${{ matrix.subtarget }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-sdk.sh') }}
+          path: sdk-cache
+
+      - name: Extract the SDK
+        id: extract
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          [ -n "${sdk_archive:-}" ] || { echo "the SDK archive name was not recorded"; exit 1; }
+          mkdir -p sdk
+          tar --zstd -xf "sdk-cache/${sdk_archive}" -C sdk
+          echo "sdk_seconds=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: Prepare the SDK configuration
+        id: config
         run: |
           set -euo pipefail
-          # A released SDK ships a target .config. Recreate the selection only
-          # when it is missing, so build-sdk.sh can still verify target and
-          # subtarget.
-          if [ ! -f "${SDK_DIR}/.config" ]; then
-            {
-              echo "CONFIG_TARGET_${{ matrix.target }}=y"
-              echo "CONFIG_TARGET_${{ matrix.target }}_${{ matrix.subtarget }}=y"
-              echo "CONFIG_TARGET_BOARD=\"${{ matrix.target }}\""
-              echo "CONFIG_TARGET_SUBTARGET=\"${{ matrix.subtarget }}\""
-              echo "CONFIG_TARGET_ARCH_PACKAGES=\"${{ matrix.arch }}\""
-              echo "CONFIG_USE_APK=y"
-            } > "${SDK_DIR}/.config"
-            make -C "${SDK_DIR}" defconfig
-          fi
-          grep -E '^CONFIG_(TARGET_BOARD|TARGET_SUBTARGET|TARGET_ARCH_PACKAGES)=' "${SDK_DIR}/.config"
-          grep -Fqx "CONFIG_TARGET_ARCH_PACKAGES=\"${{ matrix.arch }}\"" "${SDK_DIR}/.config"
+          start=$SECONDS
+          sdk_dir="sdk/${sdk_archive%.tar.zst}"
+          [ -d "$sdk_dir" ] || { echo "the SDK was not extracted into ${sdk_dir}"; exit 1; }
+          echo "SDK_DIR=${PWD}/${sdk_dir}" >> "$GITHUB_ENV"
+          echo "sdk_dir=${PWD}/${sdk_dir}" >> "$GITHUB_OUTPUT"
+          # The SDK ships no .config. scripts/build-sdk.sh writes a minimal
+          # one and completes it with "make defconfig"; the target metadata
+          # is verified there against the SDK archive name.
+          echo "config_seconds=$((SECONDS - start))" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: Restore the cached source downloads
+        id: cache_dl
+        uses: actions/cache/restore@v4
+        with:
+          key: dl-${{ env.SDK_VERSION }}-${{ matrix.target }}-${{ matrix.subtarget }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-sdk.sh') }}
+          path: ${{ steps.config.outputs.sdk_dir }}/dl
 
       - name: Build the packages
-        run: scripts/build-sdk.sh "${SDK_DIR}" "${{ matrix.target }}" "${{ matrix.subtarget }}"
-
-      - name: Collect the APKs
+        id: build
         run: |
           set -euo pipefail
-          arch="${{ matrix.arch }}"
-          version=$(sed -n 's/^PKG_VERSION:=//p' device-access/Makefile)
-          release=$(sed -n 's/^PKG_RELEASE:=//p' device-access/Makefile)
+          start=$SECONDS
+          mkdir -p diagnostics
+          export ODAC_BUILD_METRICS="${PWD}/diagnostics/build-metrics.tsv"
+          rc=0
+          sh scripts/build-sdk.sh "${SDK_DIR}" "${TARGET}" "${SUBTARGET}" > diagnostics/sdk-build.log 2>&1 || rc=$?
+          echo "SDK build exit status: ${rc} (full log in diagnostic artifact)"
+          [ "$rc" -eq 0 ] || exit "$rc"
+          elapsed=$((SECONDS - start))
+          echo "build_seconds=${elapsed}" >> "$GITHUB_ENV"
+
+      - name: Save the source downloads to the cache
+        if: steps.cache_dl.outputs.cache-hit != 'true' && steps.build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          key: dl-${{ env.SDK_VERSION }}-${{ matrix.target }}-${{ matrix.subtarget }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-sdk.sh') }}
+          path: ${{ steps.config.outputs.sdk_dir }}/dl
+
+      - name: Validate the produced APKs and collect them
+        id: collect
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          arch="${ARCH}"
+          target="${TARGET}"
+          subtarget="${SUBTARGET}"
           mkdir -p dist
-          # Publish under the release convention name-version-rN-arch.apk.
-          for dir in $(find "${SDK_DIR}/bin/packages" -type d -name "${arch}"); do
-            find "${dir}" -type f -name '*.apk' | while read -r apk; do
-              cp -v "${apk}" "dist/$(basename "${apk}" .apk)-${arch}.apk"
-            done
+
+          # The package metadata is read from the APK itself, with the SDK's
+          # own apk tool. A file name is never trusted as a description of
+          # what a package contains.
+          apk_bin="${SDK_DIR}/staging_dir/host/bin/apk"
+          [ -x "${apk_bin}" ] || { echo "the SDK apk tool is missing"; exit 1; }
+
+          # Cover both per-feed and target package directories in this SDK.
+          package_dir="${SDK_DIR}/bin"
+          [ -d "${package_dir}" ] || { echo "the package directory ${package_dir} does not exist"; exit 1; }
+
+          # "apk adbdump <file.apk>" prints the package under an "info:"
+          # heading, with "name:", "version:" and "arch:" indented by two
+          # spaces. The file list follows under "paths:".
+          package_field() {
+            # $1: apk file, $2: field name
+            dump=$("${apk_bin}" adbdump "$1")
+            field=$(printf '%s\n' "$dump" | sed -n "s/^  $2: //p")
+            [ -n "$field" ] && [ "$(printf '%s\n' "$field" | wc -l)" -eq 1 ] || return 1
+            printf '%s\n' "$field"
+          }
+
+          find "${package_dir}" -type f -name '*.apk' | sort > apk-candidates.txt
+          for pkg in libargon2 odac-opennds device-access luci-app-device-access; do
+            found=""
+            while IFS= read -r candidate; do
+              [ -n "$candidate" ] || continue
+              name=$(package_field "$candidate" name)
+              if [ "$name" = "$pkg" ]; then
+                [ -z "$found" ] || { echo "duplicate package metadata for ${pkg}"; exit 1; }
+                found="$candidate"
+              fi
+            done < apk-candidates.txt
+            [ -n "$found" ] || { echo "${pkg} was not produced for ${target}/${subtarget}"; exit 1; }
+
+            declared=$(package_field "$found" arch)
+            version=$(package_field "$found" version)
+            # luci-app-device-access is architecture independent; the other
+            # three must declare the target architecture.
+            #
+            # An architecture independent package declares "noarch", not
+            # "all": package-pack.mk writes "arch:noarch" whenever PKGARCH
+            # contains "all". The value is read back from the produced package,
+            # so it is compared against what the build system actually emits.
+            if [ "$pkg" = luci-app-device-access ]; then
+              expected=noarch
+            else
+              expected="$arch"
+            fi
+            if [ "$declared" != "$expected" ]; then
+              echo "${pkg} declares arch '${declared}', expected '${expected}'"
+              exit 1
+            fi
+            # The version must be the one the recipes declare.
+            case "$pkg" in
+              libargon2)
+                expected_version=$(sed -n 's/^PKG_VERSION:=//p' argon2/Makefile)
+                expected_release=$(sed -n 's/^PKG_RELEASE:=//p' argon2/Makefile)
+                ;;
+              odac-opennds)
+                expected_version=$(sed -n 's/^PKG_VERSION:=//p' odac-opennds/Makefile)
+                expected_release=$(sed -n 's/^PKG_RELEASE:=//p' odac-opennds/Makefile)
+                ;;
+              *)
+                expected_version=$(sed -n 's/^PKG_VERSION:=//p' device-access/Makefile)
+                expected_release=$(sed -n 's/^PKG_RELEASE:=//p' device-access/Makefile)
+                ;;
+            esac
+            expected_version="${expected_version}-r${expected_release}"
+            if [ "$version" != "$expected_version" ]; then
+              echo "${pkg} declares version '${version}', expected '${expected_version}'"
+              exit 1
+            fi
+            echo "${pkg}: arch=${declared} version=${version}"
+            cp "${found}" "dist/${pkg}-${version}-${target}-${subtarget}.apk"
           done
-          for pkg in device-access luci-app-device-access; do
-            [ -n "$(ls dist/${pkg}-${version}-r${release}-${arch}.apk 2>/dev/null)" ] || {
-              echo "${pkg} ${version}-r${release} was not packaged for ${arch}"; ls -l dist; exit 1; }
-          done
-          [ -n "$(ls dist/libargon2-*-${arch}.apk 2>/dev/null)" ] || {
-            echo "libargon2 was not packaged for ${arch}"; ls -l dist; exit 1; }
+
           (cd dist && sha256sum ./*.apk > SHA256SUMS)
+          elapsed=$((SECONDS - start))
+          echo "collect_seconds=${elapsed}" >> "$GITHUB_ENV"
           ls -l dist
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odac-diagnostics-${{ matrix.target }}-${{ matrix.subtarget }}
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Summarise this architecture
+        if: always()
+        env:
+          SDK_CACHE_HIT: ${{ steps.cache_sdk.outputs.cache-hit }}
+          DL_CACHE_HIT: ${{ steps.cache_dl.outputs.cache-hit }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Target | ${TARGET}-${SUBTARGET} |"
+            echo "| Architecture | ${ARCH} |"
+            echo "| SDK | ${SDK_VERSION} |"
+            echo "| SDK archive | ${sdk_archive:-not verified} |"
+            echo "| SDK size (bytes) | ${sdk_bytes:-not measured} |"
+            echo "| Host preparation (s) | ${host_seconds:-not measured} |"
+            echo "| SDK download and verification (s) | ${download_seconds:-not measured} |"
+            echo "| SDK extract (s) | ${sdk_seconds:-not measured} |"
+            echo "| SDK path preparation (s) | ${config_seconds:-not measured} |"
+            echo "| Build total (s) | ${build_seconds:-not completed} |"
+            echo "| Collect and metadata check (s) | ${collect_seconds:-not completed} |"
+            echo "| SDK cache hit | ${SDK_CACHE_HIT:-false} |"
+            echo "| Source cache hit | ${DL_CACHE_HIT:-false} |"
+            echo "| Build result | ${BUILD_OUTCOME} |"
+            echo "| APK validation result | ${COLLECT_OUTCOME} |"
+            if [ -f diagnostics/build-metrics.tsv ]; then
+              while read -r stage seconds status; do
+                echo "| ${stage} (s), exit ${status} | ${seconds} |"
+              done < diagnostics/build-metrics.tsv
+            fi
+            echo ""
+            echo "| APK | Size (bytes) | SHA256 |"
+            echo "|---|---|---|"
+            for apk in dist/*.apk; do
+              [ -e "$apk" ] || continue
+              size=$(stat -c%s "$apk")
+              sum=$(sha256sum "$apk" | cut -d' ' -f1)
+              echo "| $(basename "$apk") | ${size} | \`${sum}\` |"
+            done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: odac-apk-${{ matrix.arch }}
+          name: odac-apk-${{ matrix.target }}-${{ matrix.subtarget }}
           path: |
             dist/*.apk
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
+  # ---------------------------------------------------------------------------
+  # The release job. It runs only for a version tag, and only after every
+  # architecture in the matrix has succeeded.
+  # ---------------------------------------------------------------------------
   release:
     name: attach the APKs to the release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [scope, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.scope.outputs.scope == 'full'
     runs-on: ubuntu-latest
+    permissions:
+      # Only this job may write to a Release. A pull request never reaches
+      # it, so a pull request never holds this permission.
+      contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: odac-apk-*
+
+      - name: Verify the attachment set before publishing
+        env:
+          SCOPE: ${{ needs.scope.outputs.scope }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          [ "$SCOPE" = full ] || { echo 'release requires a full build'; exit 1; }
+          # Validate the checksums carried by each build artifact before copying.
+          for artifact in dist/odac-apk-*; do
+            [ -d "$artifact" ] || { echo 'missing build artifacts'; exit 1; }
+            (cd "$artifact" && sha256sum -c SHA256SUMS)
+            for apk in "$artifact"/*.apk; do
+              [ -f "$apk" ] || exit 1
+              name=$(basename "$apk")
+              [ ! -e "out/$name" ] || { echo "duplicate asset $name"; exit 1; }
+              cp "$apk" "out/$name"
+            done
+          done
+          expected_count=0
+
+          # Every architecture of the full matrix must be present, and each of
+          # them must carry all four ODAC packages. A partial set is never
+          # published. The list is the same file the build matrix uses.
+          all_targets=$(grep -vE '^\s*(#|$)' scripts/targets.txt)
+
+          argon2_version=$(sed -n 's/^PKG_VERSION:=//p' argon2/Makefile)
+          argon2_release=$(sed -n 's/^PKG_RELEASE:=//p' argon2/Makefile)
+          odac_version=$(sed -n 's/^PKG_VERSION:=//p' device-access/Makefile)
+          odac_release=$(sed -n 's/^PKG_RELEASE:=//p' device-access/Makefile)
+          nds_version=$(sed -n 's/^PKG_VERSION:=//p' odac-opennds/Makefile)
+          nds_release=$(sed -n 's/^PKG_RELEASE:=//p' odac-opennds/Makefile)
+
+          while read -r target subtarget arch; do
+            [ -n "$target" ] || continue
+            for entry in \
+              "libargon2:${argon2_version}-r${argon2_release}" \
+              "odac-opennds:${nds_version}-r${nds_release}" \
+              "device-access:${odac_version}-r${odac_release}" \
+              "luci-app-device-access:${odac_version}-r${odac_release}"
+            do
+              pkg=${entry%%:*}
+              version=${entry##*:}
+              name="${pkg}-${version}-${target}-${subtarget}.apk"
+              expected_count=$((expected_count + 1))
+              [ -f "out/${name}" ] || {
+                echo "missing ${name}; the release would be incomplete"
+                ls -l out
+                exit 1
+              }
+            done
+          done <<< "$all_targets"
+
+          set -- out/*.apk
+          [ "$#" -eq "$expected_count" ] || { echo 'unexpected release packages'; exit 1; }
+          # The checksum list must cover every published file and must match.
+          (cd out && sha256sum ./*.apk > SHA256SUMS)
+          (cd out && sha256sum -c SHA256SUMS)
+          ls -l out
 
       - name: Upload the APKs
         env:
@@ -165,12 +534,21 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          mkdir -p out
-          find dist -name '*.apk' -exec cp -v {} out/ \;
-          # One combined checksum file for every architecture.
-          (cd out && sha256sum ./*.apk > SHA256SUMS)
-          ls -l out
-          gh release view "${tag}" >/dev/null 2>&1 ||
-            gh release create "${tag}" --title "ODAC ${tag}" \
-              --generate-notes --prerelease
-          gh release upload "${tag}" out/*.apk out/SHA256SUMS --clobber
+          # Refuse an existing release. A failed attempt remains a draft for
+          # inspection; a retry requires deliberate removal of that draft.
+          # create also fails if view failed due to a transient API error and
+          # the release actually already exists.
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo 'release already exists; review it before retrying' >&2
+            exit 1
+          fi
+          gh release create "${tag}" --verify-tag --draft --title "ODAC ${tag}" \
+            --generate-notes --prerelease
+          gh release upload "${tag}" out/*.apk out/SHA256SUMS
+          # Download the entire draft asset set and verify both its inventory
+          # and its contents before making it visible as a prerelease.
+          gh release download "${tag}" --dir uploaded
+          diff <(cd out && printf '%s\n' *) <(cd uploaded && printf '%s\n' *)
+          cmp out/SHA256SUMS uploaded/SHA256SUMS
+          (cd uploaded && sha256sum -c SHA256SUMS)
+          gh release edit "${tag}" --draft=false

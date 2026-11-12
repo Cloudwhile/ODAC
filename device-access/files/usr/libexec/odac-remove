@@ -1,38 +1,99 @@
 #!/bin/sh
-# Package removal deliberately retains a durable controlled-network deny rule.
+# Ordinary removal retains data and a durable, interface-scoped closed guard.
 set -eu
+umask 077
 [ "${1:-}" = --retain-guard ] || { echo 'Usage: odac-remove --retain-guard' >&2; exit 2; }
-iface=$(uci -q get odac.main.interface || true)
-[ -n "$iface" ] || exit 0
-# A never-configured, disabled installation owns no services or firewall state.
-if [ "$(uci -q get odac.main.enabled || echo 0)" != 1 ] && [ ! -f /etc/odac/last-setup ]; then
- nft list table inet odac_guard >/dev/null 2>&1 || exit 0
+[ "$(id -u)" = 0 ] || { echo 'Root required' >&2; exit 1; }
+. /usr/libexec/odac-ownership
+fail() { echo "odac-remove: $*" >&2; exit 1; }
+mkdir /var/lock/odac-setup.lock 2>/dev/null || fail 'Another lifecycle operation is running or needs recovery'
+retired_tmp=''
+cleanup() {
+	[ -z "$retired_tmp" ] || rm -f "$retired_tmp"
+	rmdir /var/lock/odac-setup.lock
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+ownership_file=$(odac_ownership_file)
+[ -f "$ownership_file" ] || exit 0
+
+iface=$(odac_ownership_get iface)
+zone=$(odac_ownership_get zone)
+sections=$(odac_ownership_get firewall_sections)
+guard_active=$(odac_ownership_get guard)
+opennds_managed=$(odac_ownership_get opennds_managed)
+case "$iface" in
+	''|*[!a-zA-Z0-9_.:-]*) fail 'Missing or invalid controlled interface';;
+esac
+[ "${#iface}" -le 15 ] || fail 'Invalid controlled interface length'
+
+# Both the reserved name and the recorded content must match. Modified
+# sections require operator reconciliation: fail the package hook so the
+# package and its firewall include remain installed for recovery.
+check_section_name() {
+	case "$1" in
+		odac_guard|odac_dns|odac_dhcp|odac_http|odac_https|odac_nds) :;;
+		*) fail "Unexpected recorded firewall section: $1";;
+	esac
+}
+check_section_ownership() {
+	section=$1
+	if uci -q get "firewall.$section" >/dev/null; then
+		odac_firewall_section_unchanged "$section" ||
+			fail "firewall.$section differs from the recorded section; reconcile it before retrying"
+	fi
+}
+for section in $sections; do check_section_name "$section"; done
+
+retired=/etc/nftables.d/90-odac-retired.nft
+[ ! -L /etc/nftables.d ] && [ ! -L "$retired" ] || fail 'Refusing symbolic link for retired guard'
+mkdir -p /etc/nftables.d
+retired_tmp=$(mktemp /etc/nftables.d/.odac-retired-XXXXXXXX)
+printf 'chain odac_retired_forward { type filter hook forward priority -10; policy accept; iifname "%s" drop; oifname "%s" drop; }\nchain odac_retired_input { type filter hook input priority -10; policy accept; iifname "%s" drop; }\n' "$iface" "$iface" "$iface" > "$retired_tmp"
+if [ -e "$retired" ]; then
+	cmp -s "$retired_tmp" "$retired" || fail 'Existing retired guard differs; refusing to overwrite it'
 fi
-case "$iface" in *[!a-zA-Z0-9_.:-]*) echo 'Invalid controlled interface' >&2; exit 1;; esac
-# Save pre-removal state independently of setup history, including on upgrades.
-umask 077
-mkdir -p /etc/odac
-removal_backup=$(mktemp -d /etc/odac/removal-XXXXXXXX)
-for file in odac opennds uhttpd firewall; do cp -p "/etc/config/$file" "$removal_backup/$file"; done
-/etc/init.d/opennds enabled && echo 1 > "$removal_backup/opennds-enabled" || echo 0 > "$removal_backup/opennds-enabled"
-# Even if service stop fails, never proceed with an unguarded uninstall.
-/usr/libexec/odac-firewall close "$iface"
-/etc/init.d/odac stop
-/etc/init.d/opennds stop
-/etc/init.d/opennds disable
-/etc/init.d/odac disable
-mkdir -p /etc/nftables.d /etc/odac
-umask 077
-# This snippet is INSIDE table inet fw4 and needs no removed ODAC binary.
-# Preserve it and /etc/odac during apk removal; it is operator-owned recovery data.
-printf 'chain odac_retired_forward { type filter hook forward priority -10; policy accept; iifname "%s" drop; oifname "%s" drop; }\nchain odac_retired_input { type filter hook input priority -10; policy accept; iifname "%s" drop; }\n' "$iface" "$iface" "$iface" > /etc/nftables.d/90-odac-retired.nft.new
-mv /etc/nftables.d/90-odac-retired.nft.new /etc/nftables.d/90-odac-retired.nft
-uci -q delete firewall.odac_guard || true
-for section in dns dhcp http https nds; do uci -q delete firewall.odac_$section || true; done
+
+# Close admission before stopping any service. An error leaves the services
+# and ownership state intact, and prevents the package hook claiming success.
+if [ "$guard_active" = 1 ]; then
+	/usr/libexec/odac-firewall close "$iface" || fail 'Cannot close controlled network'
+fi
+mv "$retired_tmp" "$retired"
+retired_tmp=''
+fw4 check || fail 'Retired guard failed firewall validation'
+fw4 reload || fail 'Cannot activate durable retired guard'
+odac_ownership_set retired_guard 1
+
+/etc/init.d/odac stop || fail 'Cannot stop ODAC'
+/etc/init.d/odac disable || fail 'Cannot disable ODAC'
+if [ "$opennds_managed" = 1 ]; then
+	/etc/init.d/opennds stop || fail 'Cannot stop managed openNDS'
+	/etc/init.d/opennds disable || fail 'Cannot disable managed openNDS'
+fi
+
+# Validate every surviving section before deleting any of them.
+for section in $sections; do check_section_ownership "$section"; done
+for section in $sections; do
+	if uci -q get "firewall.$section" >/dev/null; then
+		uci delete "firewall.$section" || fail "Cannot remove firewall.$section"
+	fi
+done
 uci commit firewall
-uci set odac.main.enabled=0
-uci commit odac
-fw4 check
-fw4 reload
-# Runtime leases/table remain denied. Data and backups are intentionally retained.
-echo 'ODAC stopped. Controlled network remains DROP; user database and backups retained.' >&2
+if [ -f /etc/config/odac ]; then
+	uci set odac.main.enabled=0
+	uci commit odac
+fi
+fw4 check || fail 'Firewall validation failed after retiring ODAC rules'
+fw4 reload || fail 'Firewall reload failed after retiring ODAC rules'
+
+# Clear only after all retirement steps succeeded. Keep interface and guard
+# provenance so data cleanup does not discard the recovery instructions.
+for section in $sections; do odac_ownership_unset "firewall_sha256_$section"; done
+odac_ownership_unset firewall_sections
+odac_ownership_set odac_active 0
+odac_ownership_set guard 0
+odac_ownership_set opennds_managed 0
+odac_ownership_unset enable_pending
+echo 'ODAC stopped. Controlled network remains closed; user database and backups retained.' >&2
