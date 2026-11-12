@@ -311,8 +311,12 @@ Make prerequisite trace，不能把每一条边都视为已证实。SDK 的 feed
   libmicrohttpd/nossl，全部在 odac-opennds 调用内）与此一致。此前的构建没有
   保存生成的 `.packagedeps`，所以这条边本身还没有被直接读到。
   这些是 SDK 构建图要求的依赖，不删除。
-- **选中的包符号有 1473 个，其中 1176 个是 `kmod-*`**，尽管输入配置写了
-  `# CONFIG_ALL_KMODS is not set`。来源未确认，确认前不改动选择。
+- **选中的包符号有 1473 个，其中 1176 个是 `kmod-*`，来自 SDK 自带的默认值**。
+  已校验的官方 x86/64 SDK 归档中的 `Config-build.in` 为 1455 个 `PACKAGE_*`
+  符号记录了默认值（含全部 1176 个 `kmod-*`），CI 选中的 1473 个正好是这
+  1455 个加上 ODAC 四包及其依赖的 18 个。也就是说内核模块打包是 SDK 发布
+  配置带来的，不是 ODAC 的依赖；输入配置里的 `# CONFIG_ALL_KMODS is not set`
+  不会取消这些逐包默认值。本次不改动这一选择。
 - **Runner 之间的波动很大**。相同步骤的总时长为 2403、2486、3105 s
   （gettext 302/313/384 s），单次对比不足以证明提速或变慢。
 
