@@ -16,14 +16,15 @@
 | 启用事务（所有权先记录、回滚、WAN6 核对、拒绝中断/未登记状态） | 宿主沙箱测试通过（10 项，`scripts/test-deployment.py`，含 openNDS 延迟就绪及始终未就绪回滚），5 个故意注入的缺陷均被检出 |
 | 构建脚本单元测试（feeds 选择、Kconfig、版本与 target 校验、拒绝官方 opennds） | 桩测试通过（25 项） |
 | workflow 结构校验 + shell 语法检查 | 通过（`tests/workflow_check.py`，11 个目标） |
-| workflow 变异回归 + 校验和夹具 | 通过（4 项，`tests/workflow_negative_test.sh`） |
+| workflow 变异回归 + 校验和夹具 | 通过（6 项，含各包独立版本与发布缺包拒绝，`tests/workflow_negative_test.sh`） |
 | 构建范围解析（矩阵内容） | 通过（12 项，`tests/scope_test.sh`） |
 | 11 个架构的 `arch` 与官方 `profiles.json` 一致 | 逐项核对通过 |
 | 11 个目标均有官方 SDK 归档且归档名正则匹配 | 逐项核对通过 |
 | 真实 SDK 构建与 APK 产出（含 `odac-opennds` 的 autoreconf 与链接） | 提交 `10726da` 的 [x86/64 CI 43154130757](https://github.com/Cloudwhile/ODAC/actions/runs/43154130757) 成功产出四包；`d7b95ec` 的构建成功但内容收集误判失败；修复提交 `90ac2ea`（[43180259567](https://github.com/Cloudwhile/ODAC/actions/runs/43180259567)）与 `c98f0f7`（[43186925580](https://github.com/Cloudwhile/ODAC/actions/runs/43186925580)）均成功，三次构建的四个 APK 逐字节一致。本地 SDK 编译按要求跳过 |
 | 官方 `opennds` 与 `odac-opennds` 同时安装时 apk 是否因文件冲突拒绝 | **未验证**。在已装 `odac-opennds` 的 VM 上 `apk add --simulate opennds` 求解通过，说明元数据层面不冲突；模拟不检查文件冲突，真实事务没有执行（官方包的 postinst 可能接管管理 LAN）。由 preflight 拒绝兜底 |
-| openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | VM 上通过临时诊断脚本启用后，nds 规则仅引用 `br-odac`，没有 `firewall.opennds`、WAN6 或 DHCP 配置改动；管理面检查通过。但 openNDS 启停仍重启共享 dnsmasq，日志报 reload/restart failed，影响待查；没有真实受控客户端，不构成准入验收 |
+| openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | VM 上通过临时诊断脚本启用后，nds 规则仅引用 `br-odac`，没有 `firewall.opennds`、WAN6 或 DHCP 配置改动；管理面检查通过。上游 v10.3.1 源码确认正常启动请求三次共享 dnsmasq reload，终止请求一次 restart，上述选项不能抑制；helper 未保留服务命令退出码，日志的失败原因与实际 DNS 影响仍未确认。没有真实受控客户端，不构成准入验收 |
 | VM 启用、回滚与停用 | r1 原版启用两次在单次 `ndsctl json` 检查处退出 3 并回滚，守卫保持关闭、管理配置不变。无端口的桥虽通过 preflight，openNDS 因无链路无法启动；从官方源安装 kmod-dummy 并仅在运行时将 dummy0 接入 br-odac 后，临时诊断脚本等待 4 秒即启用成功。诊断期间门户 HTTPS 200、管理面检查通过；原版 `--disable` 退出 0，数据库保留、退役守卫加载，openNDS 数秒后退出，随后管理面检查通过。**诊断脚本成功不等于原版启用通过**。r2 改为最多 30 次就绪检查，失败仍回滚；新包 VM 验收待执行 |
+| r2 构建收集失败 | [43242116170](https://github.com/Cloudwhile/ODAC/actions/runs/43242116170) 的编译完成，device-access r2 内容与 ELF 检查通过；收集步骤把 LuCI r1 误按后端 r2 验证而失败，未上传 APK 产物。已修正收集与 Release 清单按各自配方读取版本，6 项 workflow 回归通过；修正后的 CI 产物尚待验证，不能将本次运行记为成功交付 |
 | 真实路由器安装/升级/停用/卸载 | **未验证** |
 | OpenWrt 25.12.2 x86/64 测试虚拟机（**不是干净镜像**） | 2026-11-12 用测试签名包实测。首次安装后和重新安装后各做一次管理面检查（新建 SSH、LuCI HTTP 与 HTTPS、LuCI 登录、HTTPS `apk update`、外网），全部通过；卸载后在 VM 上检查了 HTTPS `apk update` 和外网，没有检查 LuCI。**安装**：四个文件经 `apk --keys-dir` 验签后安装，未用 `--allow-untrusted`；安装后 `odac.main.enabled=0`，openNDS 为 `enabled 0`、`gatewayinterface odac-unconfigured`，`opennds` 与 `odacd` 未运行，nft 仍只有 `inet fw4`，network、firewall、dhcp、uhttpd、dropbear 五个配置和 `/lib/libustream-ssl.so` 及其所有者不变，没有包被移除；系统日志有门控记录 `odac-opennds: not started`；`ldd` 对 `odacd`、`odacctl`、`opennds`、`ndsctl` 全部解析成功。**默认配置下启用**：`odac-setup --enable` 被 preflight 拒绝（退出 1），配置、规则集、文件、地址和进程都没有变化，没有生成 ownership，锁已释放；`--disable` 退出 0 且无变化；`--restore-network` 拒绝。**卸载**：`apk del` 四包退出 0，管理配置、TLS 提供者、nft 表和地址不变；未修改的 `/etc/config/odac`、`/etc/config/opennds` 与空的 `/etc/odac` 随包删除。**重新安装**：结果与首次相同。**后续启用实验**见上方独立条目。**未完成**：修复后的原版启用、真实客户端准入、带数据库的卸载保留、版本升级、干净镜像首次安装。VM 上有旧安装的残留（首次安装时 Argon2 库已存在并被同版本替换；`network.odac_device`、`dhcp.odac` 仍在） |
 | 真实 LuCI 主题下的管理页渲染 | 静态资源与菜单/ACL 已验证，浏览器内渲染**未验证** |
@@ -408,7 +409,8 @@ uci commit odac
 - OpenWrt 25.12 的 busybox **不含 `stat` applet**。项目脚本已改用 `ls -ld`，但自写的运维脚本若依赖 `stat -c`，需改用 `ls -ld` 或安装 `coreutils-stat`。
 - 受控桥必须具有链路；无端口的桥可能通过当前 preflight，但 openNDS 不会就绪。
 - 停用命令返回后，openNDS 可能还需数秒退出；期间退役守卫保持关闭。opennds 配置仍可为 enabled=1，启动门控另行检查 ODAC 的 enabled=0。
-- VM 诊断启用期间观察到 openNDS 监听 `0.0.0.0:2050`，尽管日志声称绑定受控地址；实际可达范围与共享 dnsmasq 启停影响仍需客户端验证。
+- VM 诊断启用期间观察到 openNDS 监听 `0.0.0.0:2050`。上游 v10.3.1 的 `start_mhd()` 未指定监听地址，因此符合其通配监听实现；日志打印受控地址不代表 socket 已绑定该地址。请求级接口判断不能代替网络隔离，实际可达范围仍需客户端验证。
+- 上游 DNS helper 的 `revert` 对整个 DHCP 配置执行 `uci revert dhcp`，且关闭 option 114 仍会进入删除配置路径；VM 中 DHCP 文件未变不能推广为绝不触碰 DHCP。共享 dnsmasq 的实际影响与失败日志原因未确认，源码调用链见[根因分析](root-cause.md#未验证)。
 - 从未启用过的系统上执行 `/etc/init.d/odac stop`（卸载时也会触发）会打印一行
   `odac-firewall: invalid request or unavailable guard`，退出码仍为 0：此时没有守卫表可关闭，不影响卸载。
 - uhttpd 的 CGI 模式不实现 `Expect: 100-continue` 握手。用 curl 向门户 CGI 发 POST 时需加 `-H "Expect:"`，否则请求体不会送达 CGI。

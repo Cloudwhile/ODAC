@@ -121,8 +121,30 @@ LuCI 不可用与管理链路异常的**候选机制**，但不能单独解释�
 测试证书及 dummy 端口后，r1 原版启用因立即检查尚未就绪的 ndsctl 而失败并回滚；
 诊断副本等待 4 秒后成功。r2 增加有限次数的就绪检查，修复包的 VM 验收待执行。
 诊断启用期间 nds 规则仅引用 br-odac，WAN6、DHCP 配置不变，管理面检查通过；
-但 openNDS 启停仍重启共享 dnsmasq，其失败日志与短暂 DNS 影响尚待调查。
 没有真实受控客户端，不能据此声称完成准入验收。
+
+对固定版本 v10.3.1 的源码只读调查确认：
+
+- [main.c](https://github.com/openNDS/openNDS/blob/v10.3.1/src/main.c#L522)
+  在启动时两处调用 `reload_only`（另一处在 894 行，为后台调用），
+  [fw_iptables.c](https://github.com/openNDS/openNDS/blob/v10.3.1/src/fw_iptables.c#L423)
+  在内部防火墙初始化时再调用一次；正常启动共请求三次 reload。
+  [终止处理](https://github.com/openNDS/openNDS/blob/v10.3.1/src/main.c#L186)
+  无条件请求一次 `restart_only`。现有四个配置选项不能抑制这些调用。
+- [dnsconfig.sh](https://github.com/openNDS/openNDS/blob/v10.3.1/forward_authentication_service/libs/dnsconfig.sh#L57)
+  操作共享 dnsmasq 服务，没有独立实例选择；调用服务命令后直接退出 0，
+  未保留其真实退出状态。C 调用点只输出通用 `system()` 失败日志，后台调用也
+  不等待 reload 完成。因此 VM 日志不能证明 dnsmasq 服务失败，具体原因和实际
+  DNS 影响尚未确认，不能把子进程回收竞态等推测写成已确认根因。
+- helper 的 `revert` 对整个 DHCP 配置执行 `uci revert dhcp`，option 114 关闭时
+  `cpidconf` 仍可能删除匹配配置。VM 中 DHCP 文件不变只是该次观察。
+- [HTTP listener](https://github.com/openNDS/openNDS/blob/v10.3.1/src/http_microhttpd.c#L79)
+  没有设置 `MHD_OPTION_SOCK_ADDR`，与 VM 的 `0.0.0.0:2050` 监听一致；
+  日志打印受控地址不证明地址绑定。请求级接口判断不能代替防火墙隔离，
+  实际可达范围仍未验证。
+
+这些结论来自固定上游版本的调用链；本轮未核对 VM 可执行文件与上游源码的
+逐字节对应关系，也未测定其安装的 dnsmasq init/procd reload 行为。
 
 ---
 

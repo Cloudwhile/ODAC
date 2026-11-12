@@ -2,6 +2,7 @@
 """Exercise CI rejection paths with local fixtures; never run downloaded code."""
 import copy
 import hashlib
+import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -63,6 +64,72 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotEqual(variant, WORKFLOW)
                 errors = CHECK(variant, ROWS)
                 self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_collection_checks_each_packages_own_version(self):
+        collect = next(step["run"] for step in WORKFLOW["jobs"]["build"]["steps"]
+                       if step.get("id") == "collect")
+        # Run the actual version gate, independent of SDK discovery and payload checks.
+        gate = collect[collect.index('case "$pkg" in'):collect.index('echo "${pkg}: arch=')]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for package, recipe, version, release in [
+                ("libargon2", "argon2", "20190702", "3"),
+                ("odac-opennds", "odac-opennds", "10.3.1", "4"),
+                ("device-access", "device-access", "0.1.0_rc1", "2"),
+                ("luci-app-device-access", "luci-app-device-access", "0.2.0", "7"),
+            ]:
+                (folder / recipe).mkdir()
+                (folder / recipe / "Makefile").write_text(
+                    f"PKG_VERSION:={version}\nPKG_RELEASE:={release}\n")
+                for declared, ok in [(f"{version}-r{release}", True), ("0.1.0_rc1-r99", False)]:
+                    with self.subTest(package=package, declared=declared):
+                        result = subprocess.run(
+                            ["bash", "-eu", "-c", gate], cwd=folder,
+                            env={**os.environ, "pkg": package, "version": declared},
+                            capture_output=True, text=True)
+                        self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
+                        if not ok:
+                            self.assertIn("declares version", result.stdout)
+
+    def test_release_accepts_independent_luci_version_and_rejects_incomplete_set(self):
+        gate = next(step["run"] for step in WORKFLOW["jobs"]["release"]["steps"]
+                    if step.get("name") == "Verify the attachment set before publishing")
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "scripts").mkdir()
+            (folder / "scripts/targets.txt").write_text("x86 64 x86_64\n")
+            artifact = folder / "dist/odac-apk-x86-64"
+            artifact.mkdir(parents=True)
+            entries = [
+                ("libargon2", "argon2", "20190702", "3"),
+                ("odac-opennds", "odac-opennds", "10.3.1", "4"),
+                ("device-access", "device-access", "0.1.0_rc1", "2"),
+                ("luci-app-device-access", "luci-app-device-access", "0.2.0", "7"),
+            ]
+            manifest = []
+            for package, recipe, version, release in entries:
+                (folder / recipe).mkdir()
+                (folder / recipe / "Makefile").write_text(
+                    f"PKG_VERSION:={version}\nPKG_RELEASE:={release}\n")
+                name = f"{package}-{version}-r{release}-x86-64.apk"
+                payload = package.encode()
+                (artifact / name).write_bytes(payload)
+                manifest.append(f"{hashlib.sha256(payload).hexdigest()}  ./{name}\n")
+            (artifact / "SHA256SUMS").write_text("".join(manifest))
+            result = subprocess.run(["bash", "-c", gate], cwd=folder,
+                                    env={**os.environ, "SCOPE": "full"},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # Remove LuCI and make the remaining manifest valid: completeness must still fail.
+            for path in (folder / "out").iterdir():
+                path.unlink()
+            (artifact / name).unlink()
+            (artifact / "SHA256SUMS").write_text("".join(manifest[:-1]))
+            result = subprocess.run(["bash", "-c", gate], cwd=folder,
+                                    env={**os.environ, "SCOPE": "full"},
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"missing {name}", result.stdout)
 
     def test_scope_json_and_exit_status(self):
         import json

@@ -369,10 +369,15 @@ jobs:
                 expected_version=$(sed -n 's/^PKG_VERSION:=//p' odac-opennds/Makefile)
                 expected_release=$(sed -n 's/^PKG_RELEASE:=//p' odac-opennds/Makefile)
                 ;;
-              *)
+              luci-app-device-access)
+                expected_version=$(sed -n 's/^PKG_VERSION:=//p' luci-app-device-access/Makefile)
+                expected_release=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-device-access/Makefile)
+                ;;
+              device-access)
                 expected_version=$(sed -n 's/^PKG_VERSION:=//p' device-access/Makefile)
                 expected_release=$(sed -n 's/^PKG_RELEASE:=//p' device-access/Makefile)
                 ;;
+              *) echo "unsupported package: $pkg" >&2; exit 1 ;;
             esac
             expected_version="${expected_version}-r${expected_release}"
             if [ "$version" != "$expected_version" ]; then
@@ -512,6 +517,8 @@ jobs:
           odac_release=$(sed -n 's/^PKG_RELEASE:=//p' device-access/Makefile)
           nds_version=$(sed -n 's/^PKG_VERSION:=//p' odac-opennds/Makefile)
           nds_release=$(sed -n 's/^PKG_RELEASE:=//p' odac-opennds/Makefile)
+          luci_version=$(sed -n 's/^PKG_VERSION:=//p' luci-app-device-access/Makefile)
+          luci_release=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-device-access/Makefile)
 
           while read -r target subtarget arch; do
             [ -n "$target" ] || continue
@@ -519,7 +526,7 @@ jobs:
               "libargon2:${argon2_version}-r${argon2_release}" \
               "odac-opennds:${nds_version}-r${nds_release}" \
               "device-access:${odac_version}-r${odac_release}" \
-              "luci-app-device-access:${odac_version}-r${odac_release}"
+              "luci-app-device-access:${luci_version}-r${luci_release}"
             do
               pkg=${entry%%:*}
               version=${entry##*:}

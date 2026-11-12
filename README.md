@@ -287,8 +287,9 @@ CI 的完整说明（SDK 校验、APK 元数据校验、Release 保护、缓存�
 - `odac-opennds` 的 init 脚本不调用 `ipv6_routing`，因此启用 ODAC 不再把
   `network.wan6.proto` 改成 `none`；但 openNDS 守护进程在新选项
   （`users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0`）
-  下已做 VM 诊断观察：规则仅引用受控接口，WAN6 不变；共享 dnsmasq 仍被重启，
-  其影响与真实客户端准入尚待验证。
+  下已做 VM 诊断观察：规则仅引用受控接口，WAN6 不变。固定上游版本源码确认
+  正常启动请求三次共享 dnsmasq reload，终止请求一次 restart；配置选项不能抑制。
+  失败日志原因、实际 DNS 影响与真实客户端准入尚待验证。
 - 受控客户端只能访问门户端口，不能直连路由器的 SSH/LuCI，这是设计意图。
 - 真实路由器上的安装、验收与性能**尚未验证**。整改后的四个包已由 CI 构建，并在
   x86/64 测试虚拟机上完成安装、默认状态检查、卸载和重新安装。r1 启用暴露
