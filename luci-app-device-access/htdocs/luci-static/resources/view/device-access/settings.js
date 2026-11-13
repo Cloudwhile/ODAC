@@ -4,6 +4,49 @@
 'require fs';
 'require odac.common as C';
 
+/**
+ * 验证数字范围
+ * @param {number} n - 要验证的数字
+ * @param {number} min - 最小值（包含）
+ * @param {number} max - 最大值（包含）
+ * @param {string} label - 字段标签名（用于错误提示）
+ * @returns {string|null} 错误信息或null（如果有效）
+ */
+function validateRange(n, min, max, label) {
+	if (isNaN(n) || n < min || n > max) {
+		return label + _(' 应在 ') + min + '–' + max + _(' 之间');
+	}
+	return null;
+}
+
+/**
+ * 验证文本长度
+ * @param {string} text - 要验证的文本
+ * @param {number} maxLen - 最大长度
+ * @param {string} label - 字段标签名（用于错误提示）
+ * @returns {string|null} 错误信息或null（如果有效）
+ */
+function validateTextLength(text, maxLen, label) {
+	if (text.length > maxLen) {
+		return label + _(' 超过 ') + maxLen + _(' 个字符');
+	}
+	return null;
+}
+
+/**
+ * 验证端口号范围（1-65535）
+ * @param {string|number} val - 要验证的值
+ * @param {string} label - 字段标签名（用于错误提示）
+ * @returns {number|string} 有效的端口号或错误信息
+ */
+function validatePort(val, label) {
+	var n = parseInt(val, 10);
+	if (isNaN(n) || n < 1 || n > 65535) {
+		return label + _(' 应为 1–65535 之间的数字');
+	}
+	return n;
+}
+
 var EDIT = [
 	[ 'session_seconds', _('默认会话有效期（分钟）'), 60, 1, 10080, _('用户登录后的会话时长，1 分钟–7 天') ],
 	[ 'max_devices', _('最大设备记录数'), 1, 1, 5000, _('数据库中保留的设备记录总数上限') ],
@@ -12,7 +55,18 @@ var EDIT = [
 	[ 'max_sessions', _('最大并发认证会话'), 1, 1, 256 ],
 	[ 'upload_kbps', _('默认上行限速（kb/s，0 为不限速）'), 1, 0, 1000000 ],
 	[ 'download_kbps', _('默认下行限速（kb/s，0 为不限速）'), 1, 0, 1000000 ],
-	[ 'max_audit', _('审计日志最大条数'), 1, 10, 10000, _('超出后自动清理最旧记录') ]
+	[ 'max_audit', _('审计日志最大条数'), 1, 10, 10000, _('超出后自动清理最旧记录') ],
+	[ 'wan_interval', _('WAN 检测周期（秒）'), 1, 1, 3600, _('定期检测广域网连接状态的间隔时间') ],
+	[ 'db_max_kib', _('数据库软上限（KiB）'), 1, 1024, 1048576, _('数据库大小超过此限制时会自动清理最旧记录') ]
+];
+/* Network settings that can be edited; format: [key, label, type, description] where type is 'text'|'number' */
+var NET_EDIT = [
+	[ 'interface', _('受控网络接口'), 'text', _('如：br-guest, eth1 等') ],
+	[ 'gateway', _('门户网关地址'), 'text', _('如：192.168.100.1 或 fd00::1') ],
+	[ 'portal_hostname', _('门户主机名（HTTPS）'), 'text', _('如：portal.example.com') ],
+	[ 'portal_https_port', _('门户 HTTPS 端口'), 'number', _('默认 443，范围 1–65535') ],
+	[ 'portal_port', _('门户 HTTP 端口（仅跳转）'), 'number', _('默认 80，范围 1–65535') ],
+	[ 'upstream', _('上游认证地址'), 'text', _('可选，如留空则为本地认证') ]
 ];
 /* key, label, max length, textarea. Empty restores the built-in portal text. */
 var TEXTS = [
@@ -21,20 +75,27 @@ var TEXTS = [
 	[ 'portal_register_hint', _('注册表单提示'), 256, true ],
 	[ 'portal_footer', _('页脚说明'), 512, true ]
 ];
-var RO = [ [ 'interface', _('受控网络接口') ], [ 'gateway', _('门户网关地址') ], [ 'portal_hostname', _('门户主机名（HTTPS）') ],
-	[ 'portal_https_port', _('门户 HTTPS 端口') ], [ 'portal_port', _('门户 HTTP 端口（仅跳转）') ], [ 'upstream', _('上游认证地址') ],
-	[ 'tls_cert', _('TLS 证书') ], [ 'wan_interval', _('WAN 检测周期（秒）') ], [ 'db_max_kib', _('数据库软上限（KiB）') ] ];
+var RO = [];
 
 /* Must stay within the cgi-io upload allowance; the backup RPC itself is capped at 64 KiB. */
 var MAX_RESTORE_BYTES = 8 * 1024 * 1024;
 
+/**
+ * 下载BLOB为文件
+ * @param {string} name - 文件名
+ * @param {Blob} blob - 要下载的数据
+ */
 function saveBlob(name, blob) {
 	var a = E('a', { 'href': URL.createObjectURL(blob), 'download': name });
 	document.body.appendChild(a); a.click(); a.remove();
 	URL.revokeObjectURL(a.href);
 }
 
-/* backup returns {path,size,created_at}; the file is read through cgi-download. */
+/**
+ * 生成数据备份并下载
+ * @returns {Promise} 备份操作的Promise
+ * @throws {C.OdacError} 如果备份失败
+ */
 function doBackup() {
 	return C.call('backup', {}).then(function(d) {
 		if (!d || !d.path) throw new C.OdacError('BAD_RESPONSE', _('后端未返回备份文件路径'));
@@ -83,7 +144,8 @@ return view.extend({
 			for (var k in inputs) {
 				var i = inputs[k][0], f = inputs[k][1], n = parseInt(i.value, 10);
 				if (i.value === '') continue;
-				if (isNaN(n) || n < f[3] || n > f[4]) return C.notify(new C.OdacError('INVALID', f[1] + _(' 应在 ') + f[3] + '–' + f[4] + _(' 之间')));
+				var err = validateRange(n, f[3], f[4], f[1]);
+				if (err) return C.notify(new C.OdacError('INVALID', err));
 				p[k] = k === 'session_seconds' ? n * 60 : n;
 			}
 			C.act('settings_update', p, _('设置已保存'));
@@ -99,14 +161,56 @@ return view.extend({
 			var p = {};
 			for (var k in texts) {
 				var v = texts[k][0].value.replace(/[\r\n\t]+/g, ' ').trim(), f = texts[k][1];
-				if (v.length > f[2]) return C.notify(new C.OdacError('INVALID', f[1] + _(' 超过 ') + f[2] + _(' 个字符')));
+				var err = validateTextLength(v, f[2], f[1]);
+				if (err) return C.notify(new C.OdacError('INVALID', err));
 				p[k] = v;
 			}
 			C.act('settings_update', p, _('门户文字已保存'));
 		} }, _('保存门户文字')));
-		var ro = C.el('dl', { 'class': 'odac-dl' });
-		RO.forEach(function(f) { if (f[0] in s || f[0].indexOf('portal_') === 0) { ro.appendChild(C.el('dt', {}, f[1])); ro.appendChild(C.el('dd', {}, s[f[0]])); } });
-		body.push(C.el('div', { 'class': 'cbi-section' }, [ C.el('h3', {}, _('网络与门户（只读）')), ro ]));
+
+		var cert = {}, csec = C.el('div', { 'class': 'cbi-section' }, [ C.el('h3', {}, _('TLS 证书')),
+			C.el('p', { 'class': 'cbi-section-descr' }, _('上传 HTTPS 证书。需要提供有效的 .pem 证书文件和 .key 私钥文件。')) ]);
+		var certFile = E('input', { 'type': 'file', 'accept': '.pem,.cer,.crt', 'aria-label': _('选择证书文件') });
+		var keyFile = E('input', { 'type': 'file', 'accept': '.key', 'aria-label': _('选择私钥文件') });
+		csec.appendChild(C.field(_('证书文件（.pem/.cer/.crt）'), certFile, _('HTTPS 服务器证书')));
+		csec.appendChild(C.field(_('私钥文件（.key）'), keyFile, _('证书的私钥')));
+		if (s.tls_cert) csec.appendChild(C.el('p', { 'class': 'cbi-section-descr' }, [ _('当前证书：'), C.el('code', {}, s.tls_cert) ]));
+		body.push(csec, E('button', { 'class': 'btn cbi-button cbi-button-save', 'click': function() {
+			var cf = certFile.files[0], kf = keyFile.files[0];
+			if (!cf || !kf) return C.notify(new C.OdacError('INVALID', _('请同时选择证书文件和私钥文件')));
+			if (cf.size > 64 * 1024) return C.notify(new C.OdacError('TOO_LARGE', _('证书文件过大')));
+			if (kf.size > 64 * 1024) return C.notify(new C.OdacError('TOO_LARGE', _('私钥文件过大')));
+			Promise.all([ cf.text(), kf.text() ]).then(function(contents) {
+				var cdata = contents[0], kdata = contents[1];
+				if ((!cdata.includes('BEGIN CERTIFICATE') && !cdata.includes('BEGIN')) || !kdata.includes('BEGIN') || !kdata.includes('PRIVATE'))
+					throw new C.OdacError('INVALID', _('文件格式无效，请检查是否为正确的 PEM 格式'));
+				return C.call('upload_cert', { cert: cdata, key: kdata });
+			}).then(function() {
+				C.ok(_('证书已上传')); window.setTimeout(function() { location.reload(); }, 800);
+			}).catch(function(e) {
+				C.notify(e, _('上传失败'));
+			});
+		} }, _('上传并保存证书')));
+		var net = {}, nsec = C.el('div', { 'class': 'cbi-section' }, [ C.el('h3', {}, _('网络与门户')),
+			C.el('p', { 'class': 'cbi-section-descr' }, _('修改网络接口、网关地址和门户配置。涉及网络改动时需谨慎，错误配置可能导致连接中断。')) ]);
+		NET_EDIT.forEach(function(f) {
+			var v = s[f[0]];
+			var i = E('input', { 'type': f[2], 'class': 'cbi-input-text', 'value': v == null ? '' : String(v) });
+			net[f[0]] = [ i, f ]; nsec.appendChild(C.field(f[1], i, f[3]));
+		});
+		body.push(nsec, E('button', { 'class': 'btn cbi-button cbi-button-save', 'click': function() {
+			var p = {};
+			for (var k in net) {
+				var v = net[k][0].value.trim(), f = net[k][1];
+				if (v === '') { if (k !== 'upstream') continue; } else if (f[2] === 'number') {
+					var portResult = validatePort(v, f[1]);
+					if (typeof portResult === 'string') return C.notify(new C.OdacError('INVALID', portResult));
+					p[k] = portResult; continue;
+				}
+				p[k] = v;
+			}
+			C.act('settings_update', p, _('网络设置已保存'));
+		} }, _('保存网络设置')));
 
 		var file = E('input', { 'type': 'file', 'accept': '.json,application/json', 'aria-label': _('选择备份文件') });
 		var conf = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('输入“恢复”以确认') });

@@ -34,15 +34,33 @@
     if (e.code && ERR[e.code]) return ERR[e.code];
     if (e.code === 'NETWORK') return '无法连接认证服务器，请检查网络连接';
     if (e.code === 'BAD_RESPONSE') return '服务器响应无效，请稍后再试';
+    if (e.code === 'TIMEOUT') return '请求超时，请检查网络连接';
     return '请求失败，请稍后再试';
   }
 
+  /**
+   * 发送API请求，支持30秒超时
+   * @param {string} action - 操作名称（status/login/register/logout等）
+   * @param {object} [body] - 请求体（POST时需要）
+   * @returns {Promise} 返回响应数据或抛出错误
+   */
   function req(action, body) {
     var opt = { method: body ? 'POST' : 'GET', credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } };
     if (body) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+
+    // 30秒超时
+    var controller = new AbortController();
+    var timeout = setTimeout(function () { controller.abort(); }, 30000);
+    opt.signal = controller.signal;
+
     return fetch(API + encodeURIComponent(action), opt).then(function (r) {
+      clearTimeout(timeout);
       return r.json().catch(function () { throw { code: 'BAD_RESPONSE', message: '服务器响应无效（HTTP ' + r.status + '）' }; });
-    }, function () { throw { code: 'NETWORK', message: '无法连接认证服务器，请检查网络连接' }; })
+    }, function (err) {
+      clearTimeout(timeout);
+      if (err && err.name === 'AbortError') throw { code: 'TIMEOUT', message: '请求超时' };
+      throw { code: 'NETWORK', message: '无法连接认证服务器，请检查网络连接' };
+    })
       .then(function (j) {
         if (j && j.ok === true) return j.data || {};
         throw (j && j.error) || { code: 'BAD_RESPONSE', message: '服务器响应无效' };
@@ -64,6 +82,26 @@
   var TEXT = { portal_title: 't-title', portal_subtitle: 't-subtitle', portal_register_hint: 't-register-hint', portal_footer: 't-footer' };
   var builtin = {};
   Object.keys(TEXT).forEach(function (k) { builtin[k] = $(TEXT[k]).textContent; });
+
+  /**
+   * 安全读取localStorage，忽略权限错误
+   * @param {string} key - 键名
+   * @param {string} [defaultValue=''] - 默认值
+   * @returns {string} 存储值或默认值
+   */
+  function getLocalStorage(key, defaultValue) {
+    try { return localStorage.getItem(key) || (defaultValue || ''); } catch (e) { return defaultValue || ''; }
+  }
+
+  /**
+   * 安全写入localStorage，忽略权限错误
+   * @param {string} key - 键名
+   * @param {string} value - 值
+   */
+  function setLocalStorage(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) {}
+  }
+
   function texts(t) {
     Object.keys(TEXT).forEach(function (k) {
       var v = t && typeof t[k] === 'string' ? t[k].trim() : '';
@@ -72,7 +110,7 @@
     document.title = $('t-title').textContent;
   }
 
-  function fmt(ts) { if (!ts) return ''; var d = new Date(ts * 1000); return isNaN(d) ? '' : d.toLocaleString('zh-CN', { hour12: false }); }
+  function fmt(ts) { if (ts == null || ts === '') return ''; var d = new Date(ts * 1000); return isNaN(d) ? '' : d.toLocaleString('zh-CN', { hour12: false }); }
   function secure() { return location.protocol === 'https:'; }
 
   var authed = false;
@@ -180,17 +218,20 @@
   });
 
   var modes = ['system', 'light', 'dark'], LBL = { system: '跟随系统', light: '亮色', dark: '暗色' };
+  /**
+   * 设置并应用主题
+   * @param {string} m - 主题模式 ('system'|'light'|'dark')
+   */
   function theme(m) {
     if (m === 'system') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', m);
     $('theme').setAttribute('aria-label', '主题：' + LBL[m] + '（点击切换）'); $('theme').title = LBL[m];
   }
-  var cur = 'system';
-  try { cur = localStorage.getItem('odac-theme') || 'system'; } catch (e) {}
+  var cur = getLocalStorage('odac-theme', 'system');
   if (modes.indexOf(cur) < 0) cur = 'system';
   theme(cur);
   $('theme').addEventListener('click', function () {
     cur = modes[(modes.indexOf(cur) + 1) % modes.length]; theme(cur);
-    try { localStorage.setItem('odac-theme', cur); } catch (e) {}
+    setLocalStorage('odac-theme', cur);
   });
 
   refresh();

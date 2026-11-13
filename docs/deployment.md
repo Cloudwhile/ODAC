@@ -22,7 +22,7 @@
 | 11 个目标均有官方 SDK 归档且归档名正则匹配 | 逐项核对通过 |
 | 真实 SDK 构建与 APK 产出（含 `odac-opennds` 的 autoreconf 与链接） | 提交 `10726da` 的 [x86/64 CI 43154130757](https://github.com/Cloudwhile/ODAC/actions/runs/43154130757) 成功产出四包；`d7b95ec` 的构建成功但内容收集误判失败；修复提交 `90ac2ea`（[43180259567](https://github.com/Cloudwhile/ODAC/actions/runs/43180259567)）与 `c98f0f7`（[43186925580](https://github.com/Cloudwhile/ODAC/actions/runs/43186925580)）均成功，三次构建的四个 APK 逐字节一致。本地 SDK 编译按要求跳过 |
 | 官方 `opennds` 与 `odac-opennds` 同时安装时 apk 是否因文件冲突拒绝 | **未验证**。在已装 `odac-opennds` 的 VM 上 `apk add --simulate opennds` 求解通过，说明元数据层面不冲突；模拟不检查文件冲突，真实事务没有执行（官方包的 postinst 可能接管管理 LAN）。由 preflight 拒绝兜底 |
-| openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | VM 上通过临时诊断脚本启用后，nds 规则仅引用 `br-odac`，没有 `firewall.opennds`、WAN6 或 DHCP 配置改动；管理面检查通过。上游 v10.3.1 源码确认正常启动请求三次共享 dnsmasq reload，终止请求一次 restart，上述选项不能抑制。新源码补丁移除 daemon 中 DHCP revert、dnsmasq reload/restart 和全局 nftset 清理/初始化；封装 read-only checker，在 init 与 daemon 内分别拒绝要求这些共享 DNS 功能的配置。补丁严格套用与完整宿主快速检查通过（DNS 策略 5 项、APK 内容 10 项／ELF 8 项）；检查已前移到 config_init 前并覆盖所有 section，后端依赖要求 odac-opennds>=10.3.1-r2。VM 上对新版 checker 源码执行当前配置只读检查；另用 VM 的 `/lib/functions.sh` 执行五个合成配置案例（替换 `config_load`，不是实际 UCI 解析），合法配置接受，隐藏策略、DNS 列表、多个 opennds section 与缺失配置拒绝。没有写入 VM 配置；r1 VM 未安装新版 checker，不等于新二进制验收。新目标为 odac-opennds 10.3.1-r2／device-access 0.1.0_rc1-r3；[CI 43265042292](https://github.com/Cloudwhile/ODAC/actions/runs/43265042292) 和诊断运行 [43270166511](https://github.com/Cloudwhile/ODAC/actions/runs/43270166511) 均完成 SDK 编译，但 ELF 检查发现 `dnsconfig.sh` 字符串而拒绝收集，没有上传通过检查的新版 APK。后一次只保留未验证 APK 作为诊断材料；载荷哈希核对后，提取的 ELF 含两条 `ipset_to_nftset` 命令，与 SHA256 已核对的官方归档中 `src/auth.c` 的周期性调用一致。先前调查的局部源码副本没有 auth.c，补丁因此遗漏该路径；该分支同步旧版 ipset，不重启 dnsmasq，不能认定为此前 DNS 故障根因。当前工作区已补上移除并扩展 ELF 回归用例，既有检查未放宽；补丁对完整官方源码零模糊、零偏移套用通过，全部 C/H 文件不再含上述 DNS 命令，客户端生命周期代码与早期 checker 保留。完整宿主 fast-check 已通过（退出 0，含生命周期 267、启用事务 11、nftables 56）；首次 WSL 外层命令退出码处理失败后，改为独立脚本重跑并确认退出 0，未进行本地 SDK 构建。**包含此次补丁的 CI 产物仍待验证**；2026-11-13 VM SSH 连接超时，未检查到当前状态，也未写入 VM。VM 原版启用和真实受控客户端准入仍未验收 |
+| openNDS 守护进程在 `users_to_router_passthrough 1`、`gatewayfqdn disable`、`fwhook_enabled 0` 下的行为 | VM 上通过临时诊断脚本启用后，nds 规则仅引用 `br-odac`，没有 `firewall.opennds`、WAN6 或 DHCP 配置改动；管理面检查通过。上游 v10.3.1 源码确认正常启动请求三次共享 dnsmasq reload，终止请求一次 restart，上述选项不能抑制。新源码补丁移除 daemon 中 DHCP revert、dnsmasq reload/restart 和全局 nftset 清理/初始化；封装 read-only checker，在 init 与 daemon 内分别拒绝要求这些共享 DNS 功能的配置。补丁严格套用与完整宿主快速检查通过（DNS 策略 5 项、APK 内容 10 项／ELF 8 项）；检查已前移到 config_init 前并覆盖所有 section，后端依赖要求 odac-opennds>=10.3.1-r2。VM 上对新版 checker 源码执行当前配置只读检查；另用 VM 的 `/lib/functions.sh` 执行五个合成配置案例（替换 `config_load`，不是实际 UCI 解析），合法配置接受，隐藏策略、DNS 列表、多个 opennds section 与缺失配置拒绝。没有写入 VM 配置；r1 VM 未安装新版 checker，不等于新二进制验收。新目标为 odac-opennds 10.3.1-r2／device-access 0.1.0_rc1-r3；[CI 43265042292](https://github.com/Cloudwhile/ODAC/actions/runs/43265042292) 和诊断运行 [43270166511](https://github.com/Cloudwhile/ODAC/actions/runs/43270166511) 均完成 SDK 编译，但 ELF 检查发现 `dnsconfig.sh` 字符串而拒绝收集，没有上传通过检查的新版 APK。后一次只保留未验证 APK 作为诊断材料；载荷哈希核对后，提取的 ELF 含两条 `ipset_to_nftset` 命令，与 SHA256 已核对的官方归档中 `src/auth.c` 的周期性调用一致。先前调查的局部源码副本没有 auth.c，补丁因此遗漏该路径；该分支同步旧版 ipset，不重启 dnsmasq，不能认定为此前 DNS 故障根因。当前工作区已补上移除并扩展 ELF 回归用例，既有检查未放宽；补丁对完整官方源码零模糊、零偏移套用通过，全部 C/H 文件不再含上述 DNS 命令，客户端生命周期代码与早期 checker 保留。完整宿主 fast-check 已通过（退出 0，含生命周期 267、启用事务 11、nftables 56）；首次 WSL 外层命令退出码处理失败后，改为独立脚本重跑并确认退出 0，未进行本地 SDK 构建。修正提交 `e9b37b2` 的 [CI 43371206658](https://github.com/Cloudwhile/ODAC/actions/runs/43371206658) 已成功产出四包，Release 按设计跳过。下载后独立核对四包校验和、内容、版本、架构、载荷哈希与 6 个 ELF 全部通过；确认 device-access 依赖 odac-opennds>=10.3.1-r2。四包测试签名后严格验签通过，空密钥与无关密钥均被拒绝，签名前后结构化元数据一致；五个安装文件的哈希清单已生成，脚本载荷与源码字节一致。这仅是测试签名和产物检查，不是发布签名或安装验收。2026-11-13 VM SSH 再次连接超时，本机未发现 vmware-vmx.exe 进程，未检查到 VM 当前状态，也未写入 VM。VM 升级、原版启用和真实受控客户端准入仍未验收 |
 | VM 启用、回滚与停用 | r1 原版启用两次在单次 `ndsctl json` 检查处退出 3 并回滚，守卫保持关闭、管理配置不变。无端口的桥虽通过 preflight，openNDS 因无链路无法启动；从官方源安装 kmod-dummy 并仅在运行时将 dummy0 接入 br-odac 后，临时诊断脚本等待 4 秒即启用成功。诊断期间门户 HTTPS 200、管理面检查通过；原版 `--disable` 退出 0，数据库保留、退役守卫加载，openNDS 数秒后退出，随后管理面检查通过。**诊断脚本成功不等于原版启用通过**。r2 改为最多 30 次就绪检查，失败仍回滚；新包 VM 验收待执行 |
 | 旧 device-access r2（不含 DNS 补丁）的构建、产物复核与测试签名 | [43242116170](https://github.com/Cloudwhile/ODAC/actions/runs/43242116170) 编译完成，但收集步骤把 LuCI r1 误按后端 r2 验证而失败，未上传 APK。`1705e87` 修正收集与 Release 清单按各自配方读取版本，6 项 workflow 回归通过；[43247282658](https://github.com/Cloudwhile/ODAC/actions/runs/43247282658) 全部构建检查成功，Release 按设计跳过。下载四包后校验和、内容、载荷哈希和 ELF 检查通过（6 个 ELF，LuCI 无 ELF）；用官方 SDK apk 测试签名后严格验签通过，空密钥目录与无关公钥均被拒绝。签名前后解析后的元数据一致，r2 包内 `odac-setup` SHA256 与修复源码一致。未安装到 VM，不代表升级或原版启用验收通过 |
 | 真实路由器安装/升级/停用/卸载 | **未验证** |
@@ -211,11 +211,30 @@ scope ──┬─→ fast-check ─→ build ─→ release
 架构无关的包声明的是 `noarch` 而**不是** `all`：`package-pack.mk` 在
 `PKGARCH` 含 `all` 时写入 `arch:noarch`。
 
-`libargon2`（`20190702-r1`）和 `odac-opennds`（`10.3.1-r1`）的版本与 ODAC 两个包不同，
+当前目标版本为 `libargon2 20190702-r1`、`odac-opennds 10.3.1-r2`、
+`device-access 0.1.0_rc1-r3`、`luci-app-device-access 0.1.0_rc1-r1`，
 因此不能用一个统一版本号去校验四个包。
 
 包目录不写死：`FeedPackageDir` 可能是按 feed 划分的目录，也可能是目标目录，
 因此在 `bin/` 下查找，再按真实元数据筛选，避免把 SDK 里其他包混入 Release。
+
+### 当前待验收的 x86/64 产物
+
+来源：[CI 43371206658](https://github.com/Cloudwhile/ODAC/actions/runs/43371206658)，
+提交 `e9b37b28758605da4df6f8377123fffc06b153b3`，Artifact `odac-apk-x86-64`。
+以下是下载后独立复核的**未签名**原始包，不是正式发布包：
+
+| APK | 字节数 | SHA256 |
+| --- | ---: | --- |
+| device-access-0.1.0_rc1-r3-x86-64.apk | 73858 | e7cfb0f330b1426dfc14b323d31c3a41b137bf861e5ce5ae12268651f26c8892 |
+| libargon2-20190702-r1-x86-64.apk | 11977 | 295d79969f90a622bdc7a4f61871ca544a869b076a027c73e897966d6d3a3403 |
+| luci-app-device-access-0.1.0_rc1-r1-x86-64.apk | 17107 | 1291d96a0422b3b1bb1391eb0f68e9c1ed5881ae9c1d0cc578f5589c61293c2d |
+| odac-opennds-10.3.1-r2-x86-64.apk | 117983 | 22957429e82098584b2ebf1da30dbf8f9f8338e148f7f608a51a82a889ca0afd |
+
+另外生成了仅供 VM 验收的测试签名副本，严格验签及空密钥、无关密钥反例通过；
+签名前后元数据一致。签名副本具有独立 SHA256SUMS，不能用上表核对签名后的文件。
+测试公钥 SHA256：`0fea79f2c7929ba4795d9a0902d696a849a7dd26562117e0492a323625757096`。
+私钥未提交、未上传。新包尚未在 VM 安装，也未完成真实受控客户端准入验收。
 
 ### Release 保护
 
