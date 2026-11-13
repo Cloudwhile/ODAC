@@ -13,7 +13,7 @@
 
 var METHODS = [ 'overview', 'users', 'registrations', 'devices', 'wan', 'audit', 'settings',
 	'user_update', 'approve', 'reject', 'device_update', 'disconnect', 'settings_update',
-	'backup', 'restore' ];
+	'backup', 'restore', 'network_update', 'upload_cert', 'network_job_status' ];
 
 var raw = {};
 METHODS.forEach(function(m) {
@@ -26,15 +26,49 @@ function OdacError(code, message) {
 }
 OdacError.prototype = Object.create(Error.prototype);
 
+function unwrap(res) {
+	if (res && res.ok === true) return res.data;
+	if (res && res.ok === false && res.error)
+		throw new OdacError(res.error.code, res.error.message);
+	throw new OdacError('BAD_RESPONSE', _('后端响应格式无效'));
+}
+
 function call(method, params) {
-	return raw[method](params || {}).then(function(res) {
-		if (res && res.ok === true)
-			return res.data;
-		if (res && res.ok === false && res.error)
-			throw new OdacError(res.error.code, res.error.message);
-		throw new OdacError('BAD_RESPONSE', _('后端响应格式无效'));
-	}, function(err) {
+	return raw[method](params || {}).then(unwrap, function(err) {
 		throw new OdacError('RPC', (err && err.message) ? err.message : String(err));
+	});
+}
+
+/**
+ * Submit a system change once and wait for its final transaction result.
+ * Each status RPC is short; transient transport failures never resubmit changes.
+ * The UI deadline stops polling only: the server may still be applying/rolling back.
+ * @param {string} method network_update or upload_cert
+ * @param {Object} params Validated method arguments
+ * @returns {Promise<Object>} Settings after successful application
+ */
+function runJob(method, params) {
+	return call(method, params).then(function(start) {
+		if (!start || typeof start.job !== 'string' || !/^[0-9a-f]{32}$/.test(start.job))
+			throw new OdacError('BAD_RESPONSE', _('后端未返回有效的工作编号；请核对当前设置'));
+		var deadline = Date.now() + 600000;
+		function poll() {
+			if (Date.now() >= deadline)
+				return Promise.reject(new OdacError('TIMEOUT', _('等待结果超时；后台可能仍在应用或回滚。请稍后重新加载并核对设置，勿立即重复提交。')));
+			return call('network_job_status', { job: start.job }).then(function(status) {
+				if (status && status.done === true) return unwrap(status.result);
+				if (!status || status.done !== false)
+					throw new OdacError('BAD_RESPONSE', _('后台工作状态无效；请核对当前设置'));
+				return wait();
+			}, function(err) {
+				if (err.code !== 'RPC') throw err;
+				return wait();
+			});
+		}
+		function wait() {
+			return new Promise(function(resolve) { window.setTimeout(resolve, 2000); }).then(poll);
+		}
+		return poll();
 	});
 }
 
@@ -256,7 +290,7 @@ function macWarning() {
 }
 
 return baseclass.extend({
-	call: call, load: load, txt: txt, el: el, fmtTime: fmtTime, fmtBytes: fmtBytes, fmtRate: fmtRate,
+	call: call, runJob: runJob, load: load, txt: txt, el: el, fmtTime: fmtTime, fmtBytes: fmtBytes, fmtRate: fmtRate,
 	badge: badge, errorBox: errorBox, notify: notify, ok: ok, act: act, confirm: confirmDialog,
 	rateField: rateField, field: field, table: table, searchBox: searchBox, header: header,
 	macWarning: macWarning, OdacError: OdacError, STATUS: STATUS

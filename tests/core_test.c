@@ -87,7 +87,15 @@ int main(void)
  check(!strcmp(last_auth,"02:00:00:00:00:10"),"portal ignores client supplied MAC"); json_object_put(r);
  r=call(&c,"portal","status","{}",token); check(core_bool(data(r),"authenticated") && core_hex64(core_str(data(r),"csrf")) && !core_has(data(r),"wan") && json_object_is_type(json_object_object_get(data(r),"text"),json_type_object),"status supplies CSRF and portal text without upstream details"); json_object_put(r);
  r=call(&c,"portal","login","{\"username\":\"alice\",\"password\":\"password10\"}",NULL); check(!core_bool(r,"ok") && !strcmp(core_str(json_object_object_get(r,"error"),"code"),"CSRF"),"login requires peer CSRF"); json_object_put(r);
- r=call(&c,"admin","settings_update","{\"wan_interval\":10}",NULL); check(!core_bool(r,"ok"),"settings rejects WAN interval changes"); json_object_put(r);
+ r=call(&c,"admin","settings_update","{\"wan_interval\":10,\"db_max_kib\":4096}",NULL); check(core_bool(r,"ok") && c.config.wan_interval==10 && c.config.db_max_kib==4096,"settings applies WAN interval and database limit"); json_object_put(r);
+ check(!core_settings_load(&c) && c.config.wan_interval==10 && c.config.db_max_kib==4096,"operational settings persist in the database");
+ r=call(&c,"admin","settings_update","{\"wan_interval\":4,\"db_max_kib\":2048}",NULL); check(!core_bool(r,"ok") && c.config.db_max_kib==4096,"invalid WAN interval rejects the entire update"); json_object_put(r);
+ r=call(&c,"admin","settings_update","{\"wan_interval\":31}",NULL); check(!core_bool(r,"ok"),"WAN interval rejects values above 30"); json_object_put(r);
+ r=call(&c,"admin","settings_update","{\"db_max_kib\":511}",NULL); check(!core_bool(r,"ok"),"database limit rejects values below 512"); json_object_put(r);
+ r=call(&c,"admin","settings_update","{\"db_max_kib\":65537}",NULL); check(!core_bool(r,"ok"),"database limit rejects values above 65536"); json_object_put(r);
+ r=call(&c,"portal","settings_update","{\"wan_interval\":15}",NULL); check(!core_bool(r,"ok") && c.config.wan_interval==10,"portal clients cannot modify administrative settings"); json_object_put(r);
+ check(db_scalar(&c,"PRAGMA max_page_count",0)*db_scalar(&c,"PRAGMA page_size",0)==4096*1024,"database growth limit applies immediately");
+ r=call(&c,"admin","settings_update","{\"wan_interval\":5,\"db_max_kib\":2048}",NULL); check(core_bool(r,"ok"),"restore operational settings for subsequent timing tests"); json_object_put(r);
  r=call(&c,"admin","settings_update","{\"enabled\":false}",NULL); check(!core_bool(r,"ok") && !strcmp(core_str(json_object_object_get(r,"error"),"code"),"READ_ONLY"),"enabled is read only"); json_object_put(r);
  r=call(&c,"admin","settings_update","{\"portal_title\":\"\\u5bbf\\u820d\\u7f51\\u7edc\",\"portal_footer\":\"\\u8054\\u7cfb 8021\"}",NULL); check(core_bool(r,"ok") || (fprintf(stderr,"DEBUG %s\n",json_object_to_json_string(r)),0),"administrator can replace portal text"); json_object_put(r);
  r=call(&c,"portal","status","{}",token); check(!strcmp(core_str(json_object_object_get(data(r),"text"),"portal_title"),"\xe5\xae\xbf\xe8\x88\x8d\xe7\xbd\x91\xe7\xbb\x9c") && !strcmp(core_str(json_object_object_get(data(r),"text"),"portal_subtitle"),""),"portal status serves the administrator text and leaves unset text empty"); json_object_put(r);

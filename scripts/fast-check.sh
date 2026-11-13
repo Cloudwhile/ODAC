@@ -140,6 +140,9 @@ fi
 # sandbox with every external command stubbed; it needs no root.
 stage 'Enable transaction tests'
 python3 scripts/test-deployment.py || fail 'enable transaction tests failed'
+sh tests/network_config_test.sh || fail 'network configuration RPC tests failed'
+python3 -I tests/config_job_test.py || fail 'configuration job tests failed'
+node --test tests/portal_request_test.cjs tests/settings_view_test.cjs tests/config_job_poll_test.cjs || fail 'frontend request and settings tests failed'
 
 # --- 8. platform and nftables tests -----------------------------------------
 

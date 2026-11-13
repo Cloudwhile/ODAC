@@ -48,22 +48,28 @@
     var opt = { method: body ? 'POST' : 'GET', credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } };
     if (body) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
 
-    // 30秒超时
+    // Keep the deadline active until the response body has been consumed.
     var controller = new AbortController();
     var timeout = setTimeout(function () { controller.abort(); }, 30000);
     opt.signal = controller.signal;
 
     return fetch(API + encodeURIComponent(action), opt).then(function (r) {
-      clearTimeout(timeout);
-      return r.json().catch(function () { throw { code: 'BAD_RESPONSE', message: '服务器响应无效（HTTP ' + r.status + '）' }; });
+      return r.json().catch(function (err) {
+        if (err && err.name === 'AbortError') throw err;
+        throw { code: 'BAD_RESPONSE', message: '服务器响应无效（HTTP ' + r.status + '）' };
+      });
     }, function (err) {
-      clearTimeout(timeout);
-      if (err && err.name === 'AbortError') throw { code: 'TIMEOUT', message: '请求超时' };
+      if (err && err.name === 'AbortError') throw err;
       throw { code: 'NETWORK', message: '无法连接认证服务器，请检查网络连接' };
     })
       .then(function (j) {
         if (j && j.ok === true) return j.data || {};
         throw (j && j.error) || { code: 'BAD_RESPONSE', message: '服务器响应无效' };
+      })
+      .then(function (data) { clearTimeout(timeout); return data; }, function (err) {
+        clearTimeout(timeout);
+        if (controller.signal.aborted) throw { code: 'TIMEOUT', message: '请求超时' };
+        throw err;
       });
   }
 

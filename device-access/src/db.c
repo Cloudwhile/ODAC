@@ -56,6 +56,15 @@ void db_cleanup(struct odac *c)
  if(s) { sqlite3_bind_int64(s,1,RT(c)->now-ODAC_RETENTION_SECONDS); sqlite3_bind_int(s,2,c->config.max_audit); if(sqlite3_step(s)!=SQLITE_DONE) core_close_gate(c); } else core_close_gate(c);
  sqlite3_finalize(s);
 }
+/* SQLite cannot shrink below allocated pages; this is a soft growth limit. */
+int db_apply_limit(struct odac *c)
+{
+ long long pagesize=db_scalar(c,"PRAGMA page_size",0);
+ if(pagesize<=0) return -1;
+ char pragma[128];
+ snprintf(pragma,sizeof(pragma),"PRAGMA max_page_count=%lld",(long long)c->config.db_max_kib*1024/pagesize);
+ return db_exec(c,pragma);
+}
 int db_init(struct odac *c)
 {
  struct stat st;
@@ -68,14 +77,8 @@ int db_init(struct odac *c)
  sqlite3_limit(c->db,SQLITE_LIMIT_LENGTH,65536);
  sqlite3_limit(c->db,SQLITE_LIMIT_SQL_LENGTH,16384);
  if (db_exec(c,"PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-256;")) return -1;
- char pragma[128];
- sqlite3_stmt *s=db_prepare(c,"PRAGMA page_size");
- int pagesize=4096;
- if (s && sqlite3_step(s)==SQLITE_ROW) pagesize=sqlite3_column_int(s,0);
- sqlite3_finalize(s);
- snprintf(pragma,sizeof(pragma),"PRAGMA max_page_count=%d",c->config.db_max_kib*1024/pagesize);
- if (db_exec(c,pragma)) return -1;
- s=db_prepare(c,"PRAGMA user_version");
+ if (db_apply_limit(c)) return -1;
+ sqlite3_stmt *s=db_prepare(c,"PRAGMA user_version");
  int version=-1;
  if (s && sqlite3_step(s)==SQLITE_ROW) version=sqlite3_column_int(s,0);
  sqlite3_finalize(s);

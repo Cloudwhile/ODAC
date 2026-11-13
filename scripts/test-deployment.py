@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Host-only deployment shell integration tests; no router or host /etc mutation."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -262,6 +263,33 @@ class Deployment(unittest.TestCase):
         for http, https, expected in ((2080, 8443, 0), (2050, 8443, 1), (2080, 2050, 1), (2080, 2080, 1)):
             script = f'set -eu\nfail() {{ exit 1; }}; http={http}; https={https}\n' + ports
             self.assertEqual(subprocess.run(['sh', '-c', script], timeout=5).returncode, expected)
+
+    def test_network_config_helper_contract(self):
+        helper = (LIBEXEC / 'odac-network-config').read_text()
+        self.assertIn("json_add_object data", helper)
+        self.assertIn("json_add_boolean ok 1", helper)
+        self.assertIn("odac_firewall_section_unchanged", helper)
+        self.assertIn("/etc/init.d/opennds restart", helper)
+        self.assertIn("/etc/init.d/odac reload", helper)
+        self.assertIn("odac-setup.lock", helper)
+        self.assertIn('--upload-dir', helper)
+        self.assertIn('"$upload/cert.pem"', helper)
+        self.assertIn('"$upload/key.pem"', helper)
+        self.assertIn("1048576", helper)
+        self.assertIn("-checkhost", helper)
+        self.assertIn("cmp -s", helper)
+        self.assertIn("--config", (LIBEXEC / 'odac-preflight').read_text())
+        self.assertNotIn('eval "new_$key', helper)
+        self.assertNotIn('eval "value=${new_$key}', helper)
+
+    def test_rpc_network_methods_keep_existing_daemon_dispatch(self):
+        rpc = (LIBEXEC / 'odac-rpc').read_text()
+        self.assertIn('"network_update":{"params":{}}', rpc)
+        self.assertIn('"upload_cert":{"params":{}}', rpc)
+        self.assertIn('/usr/libexec/odac-config-job "$2"', rpc)
+        self.assertIn('"network_job_status":{"params":{}}', rpc)
+        self.assertIn('/usr/bin/odacctl "$2"', rpc)
+        self.assertIn('elif [ "$2" = settings ]', rpc)
 
 
 if __name__ == '__main__':

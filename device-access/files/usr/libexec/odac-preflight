@@ -200,6 +200,22 @@ config_foreach check_zone zone
 config_foreach check_offload defaults
 [ "$zone_found" = 1 ] || fail 'Exactly one dedicated isolated zone required'
 
+# Configuration edits may be staged before a TLS identity or admission daemon
+# is installed. Isolation checks above still apply; activation uses the full
+# preflight below.
+if [ "${1:-}" = --config ]; then
+ http=$(get portal_port); https=$(get portal_https_port)
+ for port in "$http" "$https"; do
+  case "$port" in ''|*[!0-9]*) fail 'Invalid portal port';; esac
+  [ "$port" -gt 1024 ] && [ "$port" -le 65535 ] || fail 'Use unprivileged dedicated portal ports'
+ done
+ [ "$http" != "$https" ] || fail 'HTTP and HTTPS ports must differ'
+ [ "$http" != 2050 ] && [ "$https" != 2050 ] || fail 'Port 2050 is reserved for openNDS gateway'
+ host=$(get portal_hostname)
+ case "$host" in ''|*[!a-zA-Z0-9.-]*|.*|*.) [ -z "$host" ] || fail 'Invalid portal hostname';; esac
+ exit 0
+fi
+
 # --- admission backend ---------------------------------------------------------
 # Only the dedicated odac-opennds package is used. Its init script starts
 # nothing until ODAC owns it and never changes WAN6 or the fw4 table. The
