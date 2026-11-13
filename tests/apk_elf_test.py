@@ -148,8 +148,12 @@ class ElfTest(unittest.TestCase):
                             self.run_check([('usr/bin/opennds', binary)], 'x86_64')))
         self.assertEqual(self.run_check(
             [('usr/bin/opennds', binary + marker)], 'x86_64'), [])
-        for forbidden in (b'/usr/lib/opennds/dnsconfig.sh',
-                          b'/usr/lib/opennds/libopennds.sh nftset'):
+        for forbidden in (
+                b'/usr/lib/opennds/dnsconfig.sh',
+                b'/usr/lib/opennds/libopennds.sh nftset',
+                # Actual commands retained in the rejected 10.3.1-r2 APK:
+                b'/usr/lib/opennds/dnsconfig.sh "ipset_to_nftset" "walledgarden" %d &',
+                b'/usr/lib/opennds/dnsconfig.sh "ipset_to_nftset" "blocklist" %d &'):
             with self.subTest(command=forbidden):
                 self.assertTrue(any('shared DNS lifecycle command' in error for error in
                                     self.run_check([('usr/bin/opennds', binary + marker + forbidden)],

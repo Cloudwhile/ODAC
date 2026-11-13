@@ -99,8 +99,9 @@ LuCI 不可用与管理链路异常的**候选机制**，但不能单独解释�
 
 ### 修复
 
-- 不再依赖官方 `opennds` 包。新增 `odac-opennds`：同一份上游源码，
-  只替换安装生命周期。它不安装 `40_opennds`、`restart.sh` 和官方 init 脚本；
+- 不再依赖官方 `opennds` 包。新增 `odac-opennds`：固定版本的上游源码，
+  替换安装生命周期，并通过源码补丁隔离共享 DNS/DHCP 操作（验证边界见下文）。
+  它不安装 `40_opennds`、`restart.sh` 和官方 init 脚本；
   自带的 init 脚本只有在 ODAC 已启用、`gatewayinterface` 等于受控接口、
   且该接口已在 `inet odac_guard` 的 controlled 集合中时才注册守护进程，
   不调用 `ipv6_routing` 或 `users_to_router`，也没有 `stop_service`。
@@ -141,6 +142,24 @@ LuCI 不可用与管理链路异常的**候选机制**，但不能单独解释�
   DNS 影响尚未确认，不能把子进程回收竞态等推测写成已确认根因。
 - helper 的 `revert` 对整个 DHCP 配置执行 `uci revert dhcp`，option 114 关闭时
   `cpidconf` 仍可能删除匹配配置。VM 中 DHCP 文件不变只是该次观察。
+- 2026-11-13 的产物诊断确认另一处遗漏：
+  [CI 43270166511](https://github.com/Cloudwhile/ODAC/actions/runs/43270166511)
+  完成 SDK 编译，但收集检查拒绝了 opennds ELF。诊断 APK 的载荷通过清单哈希
+  核对，提取的 ELF 在文件偏移 `0x1326f`、`0x132d0` 分别含有针对 walledgarden
+  和 blocklist 的 `dnsconfig.sh "ipset_to_nftset"` 命令。重新下载的官方归档
+  SHA256 为 `f82fe0fa2e4e8ab66abf33cae7cb20e79661c8a183af82eefa11307e9c66968d`，
+  与配方一致；完整源码的 `src/auth.c:508–522` 在 `fw_refresh_client_list()`
+  中无条件通过 `system()` 启动这两条后台命令。先前本地调查副本只有部分 src
+  文件、不含 auth.c，原补丁未覆盖这里。该 helper 分支读取旧版 ipset 并同步到
+  nftset，不执行 dnsmasq reload/restart，不能据此认定此前 DNS 故障根因。
+  当前工作区补丁只移除这两个同步调用及其局部变量，保留客户端认证、计数和
+  超时处理，也不修改上游认证/helper 脚本；ELF 回归加入实际两条命令，检查未
+  放宽。修正补丁已在完整官方归档上零模糊、零偏移套用通过，全部 C/H 文件
+  不再包含这两类 DNS 命令。完整宿主 fast-check 通过（退出 0，含生命周期
+  267、启用事务 11、nftables 56）；首次 WSL 外层命令在退出码处理处失败，
+  随后改用独立脚本重跑并确认退出 0，未做本地 SDK 构建。此次修正的 CI 产物
+  仍待验证；VM SSH 于 2026-11-13 连接超时，没有检查到当前状态或写入 VM，
+  升级、原版启用及真实客户端准入仍未验收。
 - [HTTP listener](https://github.com/openNDS/openNDS/blob/v10.3.1/src/http_microhttpd.c#L79)
   没有设置 `MHD_OPTION_SOCK_ADDR`，与 VM 的 `0.0.0.0:2050` 监听一致；
   日志打印受控地址不证明地址绑定。请求级接口判断不能代替防火墙隔离，

@@ -3,14 +3,52 @@ Subject: [PATCH] Keep shared DNS and DHCP outside the ODAC backend lifecycle
 
 The upstream startup and termination paths unconditionally revert DHCP UCI
 state and reload/restart shared dnsmasq. Even empty FQDN lists invoke nftset
-helpers that delete shared DHCP settings. ODAC uses administrator-provisioned
-DNS/DHCP and its own client policy; it must not own these operations.
+helpers that delete shared DHCP settings. The periodic client refresh also
+launches legacy ipset-to-nftset synchronization, even with empty DNS lists.
+ODAC uses administrator-provisioned DNS/DHCP and its own client policy; it
+must not own these operations or run the legacy DNS-set synchronization.
 
 Reject configuration needing the omitted DNS integration through a packaged
 read-only checker before setup, including direct daemon execution. Preserve
 client authentication/revocation and the nds firewall initialization/cleanup.
 No upstream authentication or helper script is modified by this patch.
 
+--- a/src/auth.c
++++ b/src/auth.c
+@@ -495,7 +495,6 @@
+ 	unsigned long long int uprate;
+ 	unsigned long long int downrate;
+ 	int action;
+-	char *dnscmd;
+ 	char *pmaccmd;
+ 	char msg[MID_BUF];
+ 	char *gnpa;
+@@ -505,22 +504,8 @@
+ 	int routercheck;
+ 	routercheck = check_routing(watchdog);
+-
+-	// If Walled Garden ipset exists, copy it to the nftset.
+-	dnscmd = safe_calloc(STATUS_BUF);
+-	safe_snprintf(dnscmd, STATUS_BUF, "/usr/lib/opennds/dnsconfig.sh \"ipset_to_nftset\" \"walledgarden\" %d &", config->checkinterval);
+-	if (system(dnscmd) != 0) {
+-		debug(LOG_DEBUG, "legacy ipset not defined: %s", dnscmd);
+-	}
+-	free(dnscmd);
+-
+-	// If Block List ipset exists, copy it to the nftset.
+-	dnscmd = safe_calloc(STATUS_BUF);
+-	safe_snprintf(dnscmd, STATUS_BUF, "/usr/lib/opennds/dnsconfig.sh \"ipset_to_nftset\" \"blocklist\" %d &", config->checkinterval);
+-	if (system(dnscmd) != 0) {
+-		debug(LOG_DEBUG, "legacy ipset not defined: %s", dnscmd);
+-	}
+-	free(dnscmd);
+-
++
++	/* ODAC does not synchronize administrator-managed legacy DNS sets. */
++
+ 	if (routercheck > 0) {
+ 		/* If the refresh interval has expired, refresh the downloaded remote files.
+ 			This can be used to update data files or images used by openNDS from storage on a remote server.
 --- a/src/main.c
 +++ b/src/main.c
 @@ -156,8 +156,6 @@
