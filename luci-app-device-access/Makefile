@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-device-access
-PKG_VERSION:=0.1.0_rc1
+PKG_VERSION:=0.1.0_rc2
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=ODAC Developers
