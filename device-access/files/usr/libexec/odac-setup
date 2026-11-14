@@ -1,18 +1,172 @@
 #!/bin/sh
 # Explicit local takeover; never creates or restarts network interfaces.
+#
+# This is the ONLY path that may enable admission control. Installing the
+# package must never change network state on its own.
+#
+# Transaction model
+#   1. preflight verifies isolation and refuses unsafe selections
+#   2. record ownership of everything this script is about to change
+#   3. install the fail-closed guard BEFORE anything can grant access
+#   4. apply the staged configuration atomically
+#   5. verify the result with real probes
+#   6. on any failure, roll back to the recorded previous state
+#
+# Rollback restores only what this script changed, recorded in the ownership
+# file. It never restores a whole /etc/config file from a backup, because a
+# backup may predate unrelated administrator changes.
 set -eu
 umask 077
+
 [ "$(id -u)" = 0 ] || { echo 'Root required' >&2; exit 1; }
-[ "${1:-}" = --enable ] || { echo 'Usage: odac-setup --enable' >&2; exit 2; }
-/usr/libexec/odac-preflight --setup
-mkdir -p /etc/odac
-mkdir /var/lock/odac-setup.lock 2>/dev/null || { echo 'Setup already running' >&2; exit 1; }
+
+OWNERSHIP=/usr/libexec/odac-ownership
+# shellcheck source=/dev/null
+. "$OWNERSHIP"
+
+fail() { echo "odac-setup: $*" >&2; exit 1; }
+
+# --- disable -----------------------------------------------------------------
+# A safe deactivation: admission control stops, the controlled network stays
+# closed, and the management network is untouched. The administrator can
+# then explicitly restore the original network policy with
+# "odac-setup --restore-network".
+disable_mode() {
+	# Removal and explicit disable share the same locked retirement transaction.
+	# It installs a durable closed guard and keeps ownership on any failure.
+	exec /usr/libexec/odac-remove --retain-guard
+}
+
+# --- restore network ---------------------------------------------------------
+# Removes the durable closed guard. This is only allowed when the operator
+# explicitly asks for it, because removing the guard re-opens the controlled
+# network.
+restore_network() {
+	iface=$(odac_ownership_get iface)
+	case "$iface" in ''|*[!a-zA-Z0-9_.:-]*) fail 'Missing or invalid controlled interface';; esac
+	[ "${#iface}" -le 15 ] || fail 'Invalid controlled interface length'
+	for field in odac_active guard opennds_managed; do
+		[ "$(odac_ownership_get "$field")" = 0 ] || fail 'Retirement is incomplete; disable ODAC before restoring the network'
+	done
+	[ -z "$(odac_ownership_get firewall_sections)" ] || fail 'Recorded firewall sections remain'
+	[ "$(uci -q get odac.main.enabled || echo 0)" = 0 ] || fail 'ODAC remains enabled'
+	service_rc=0
+	/etc/init.d/odac running >/dev/null 2>&1 || service_rc=$?
+	[ "$service_rc" = 1 ] || fail 'ODAC is running or its state is unknown'
+
+	# Carrier loss also yields operstate=down. Require IFF_UP to be clear;
+	# a missing device does not prove that its network cannot reappear.
+	flags=$(cat "/sys/class/net/$iface/flags") || fail 'Cannot verify controlled interface state'
+	case "$flags" in 0x[0-9a-fA-F]*) :;; *) fail 'Invalid interface flags';; esac
+	case "${flags#0x}" in *[!0-9a-fA-F]*) fail 'Invalid interface flags';; esac
+	[ "$((flags & 1))" = 0 ] || fail 'Bring the controlled interface administratively down first'
+
+	retired=/etc/nftables.d/90-odac-retired.nft
+	[ "$(odac_ownership_get retired_guard)" = 1 ] || fail 'No owned retired guard recorded'
+	[ ! -L /etc/nftables.d ] && [ ! -L "$retired" ] && [ -f "$retired" ] || fail 'Retired guard is missing or is a symbolic link'
+	expected=$(printf 'chain odac_retired_forward { type filter hook forward priority -10; policy accept; iifname "%s" drop; oifname "%s" drop; }\nchain odac_retired_input { type filter hook input priority -10; policy accept; iifname "%s" drop; }\n' "$iface" "$iface" "$iface")
+	[ "$(cat "$retired")" = "$expected" ] || fail 'Retired guard differs from the recorded interface'
+
+	# Verify the standalone table belongs to this interface before deleting it.
+	tables=$(nft list tables) || fail 'Cannot inspect firewall tables'
+	live_guard=0
+	if printf '%s\n' "$tables" | grep -qx 'table inet odac_guard'; then
+		controlled=$(nft -j list set inet odac_guard controlled) || fail 'Cannot inspect standalone guard'
+		controlled=$(printf '%s\n' "$controlled" | jsonfilter -e '@.nftables[*].set.elem[*]') || fail 'Cannot parse standalone guard'
+		[ "$controlled" = "$iface" ] || fail 'Standalone guard protects a different interface'
+		live_guard=1
+	fi
+
+	# Keep the original file outside fw4's *.nft includes until both guards
+	# are removed. A failure or signal restores it and retains ownership.
+	restore_tmp=$(mktemp /etc/nftables.d/.odac-restore-XXXXXXXX)
+	restore_pending=0
+	restore_cleanup() {
+		rc=$?
+		trap - EXIT
+		if [ "$restore_pending" = 1 ]; then
+			if mv "$restore_tmp" "$retired"; then
+				fw4 reload || { echo 'CRITICAL: retired guard reload failed; recovery required' >&2; rc=1; }
+			else
+				echo 'CRITICAL: retired guard file restoration failed; recovery required' >&2
+				rc=1
+			fi
+		else
+			rm -f "$restore_tmp" || rc=1
+		fi
+		rmdir /var/lock/odac-setup.lock || rc=1
+		exit "$rc"
+	}
+	trap restore_cleanup EXIT
+	cp -p "$retired" "$restore_tmp"
+	restore_pending=1
+	rm "$retired"
+	fw4 check || fail 'Firewall validation failed; retaining protective guard'
+	fw4 reload || fail 'Firewall reload failed; retaining protective guard'
+	if [ "$live_guard" = 1 ]; then
+		nft delete table inet odac_guard || fail 'Cannot remove standalone guard; retaining protection'
+	fi
+	odac_ownership_unset retired_guard
+	restore_pending=0
+	echo 'The protective guard was removed. The controlled network follows the ordinary firewall policy again.'
+}
+
+case "${1:-}" in
+	--disable) disable_mode ;;
+	--enable|--restore-network) : ;;
+	*) echo 'Usage: odac-setup --enable | --disable | --restore-network' >&2; exit 2 ;;
+esac
+
+mkdir /var/lock/odac-setup.lock 2>/dev/null || fail 'Another lifecycle operation is running or needs recovery'
 trap 'rmdir /var/lock/odac-setup.lock' EXIT
-backup=$(mktemp -d /etc/odac/setup-XXXXXXXX)
-retired=/etc/nftables.d/90-odac-retired.nft
-if [ -e "$retired" ]; then cp -p "$retired" "$backup/retired.nft"; fi
-for file in odac opennds uhttpd firewall; do cp -p "/etc/config/$file" "$backup/$file"; done
-/etc/init.d/opennds enabled && echo 1 > "$backup/opennds-enabled" || echo 0 > "$backup/opennds-enabled"
+trap 'exit 1' HUP INT TERM
+if [ "$1" = --restore-network ]; then restore_network; exit 0; fi
+
+# shellcheck source=/dev/null
+. "$OWNERSHIP"
+
+# --- ownership helpers -------------------------------------------------------
+
+own_set() { odac_ownership_set "$1" "$2"; }
+own_get() { odac_ownership_get "$1"; }
+own_unset() { odac_ownership_unset "$1"; }
+
+# --- openNDS configuration snapshot ------------------------------------------
+# /etc/config/opennds belongs to the dedicated odac-opennds package, so the
+# whole file is ODAC's and a failed activation restores it byte for byte.
+# The stock opennds package is refused by preflight and never adopted.
+opennds_before=/etc/odac/opennds.before-enable
+retired_before=/etc/odac/retired.before-enable
+replace_file() {
+	cp -p "$1" "$2.odac-new" && mv "$2.odac-new" "$2"
+}
+
+# --- management plane protection, before any change --------------------------
+# The management network must be proven unreachable from openNDS BEFORE this
+# script changes anything. openNDS installs "table ip nds_filter" with a base
+# chain at "hook input priority -100", i.e. ahead of fw4's own input chain,
+# and its ndsRTR chain ends in a blanket reject. If openNDS already holds the
+# management interface, the management channel is being intercepted right now
+# and no amount of later verification would undo that.
+assert_management_not_captured() {
+	mgmt=$(uci -q get network.lan.device || echo br-lan)
+	for candidate in "$mgmt" br-lan; do
+		[ -n "$candidate" ] || continue
+		if nft list table ip nds_filter 2>/dev/null | grep -q "iifname \"$candidate\""; then
+			fail "openNDS is currently intercepting the management interface $candidate; refusing to change anything"
+		fi
+	done
+}
+
+# --- preflight ---------------------------------------------------------------
+
+/usr/libexec/odac-preflight --setup
+
+# The management channel must be proven intact before anything is changed.
+assert_management_not_captured
+
+mkdir -p /etc/odac
+
 iface=$(uci -q get odac.main.interface)
 gateway=$(uci -q get odac.main.gateway)
 http=$(uci -q get odac.main.portal_port)
@@ -21,44 +175,99 @@ host=$(uci -q get odac.main.portal_hostname)
 zone=$(uci -q get odac.main.zone)
 cert=$(uci -q get odac.main.tls_cert)
 key=$(uci -q get odac.main.tls_key)
+network=$(uci -q get odac.main.network)
+
+# A previous activation must be retired explicitly, never overwritten. An
+# interrupted activation leaves enable_pending and is recovered by --disable.
+for field in odac_active enable_pending opennds_managed; do
+	[ "$(own_get "$field")" != 1 ] || fail 'ODAC is active or an activation was interrupted; run "odac-setup --disable" first'
+done
+[ -z "$(own_get firewall_sections)" ] || fail 'Recorded ODAC firewall sections remain; run "odac-setup --disable" first'
+sections='odac_guard odac_dns odac_dhcp odac_http odac_https odac_nds'
+for section in $sections; do
+	! uci -q get "firewall.$section" >/dev/null || fail "firewall.$section already exists and is not recorded as ODAC's"
+done
+
+retired=/etc/nftables.d/90-odac-retired.nft
+[ ! -L "$retired" ] && [ ! -L /etc/config/opennds ] || fail 'Refusing symbolic links'
+wan6_before=$(uci -q get network.wan6.proto || echo absent)
+cp -p /etc/config/opennds "$opennds_before"
+rm -f "$retired_before"
+[ ! -f "$retired" ] || cp -p "$retired" "$retired_before"
+
 success=0
 rollback() {
- rc=$?
- trap - EXIT HUP INT TERM
- if [ "$success" != 1 ]; then
-  /etc/init.d/odac stop || echo 'Warning: ODAC stop failed' >&2
-  /etc/init.d/opennds stop || echo 'Warning: openNDS stop failed' >&2
-  /etc/init.d/opennds disable || echo 'Warning: openNDS disable failed' >&2
-  for file in odac opennds uhttpd firewall; do
-   cp -p "$backup/$file" "/etc/config/$file.odac-rollback"
-   mv "/etc/config/$file.odac-rollback" "/etc/config/$file"
-  done
-  # Never restore an enabled configuration after failed takeover.
-  uci set odac.main.enabled=0; uci commit odac
-  /etc/init.d/odac disable || echo 'Warning: ODAC disable failed' >&2
-  /usr/libexec/odac-remove --retain-guard || echo 'CRITICAL: durable rollback guard failed; keep controlled network disconnected' >&2
-  if [ -f "$backup/retired.nft" ]; then
-   cp -p "$backup/retired.nft" "$retired.restore"
-   mv "$retired.restore" "$retired"
-   fw4 reload || echo 'CRITICAL: retired guard restoration reload failed' >&2
-  fi
-  echo "Setup failed; services disabled, guard retained. Backup: $backup" >&2
- fi
- rmdir /var/lock/odac-setup.lock
- exit "$rc"
+	rc=$?
+	trap - EXIT HUP INT TERM
+	if [ "$success" != 1 ]; then
+		[ "$rc" != 0 ] || rc=1
+		ok=1
+		echo 'odac-setup: setup failed, rolling back' >&2
+		# Close admission first; the guard table itself stays installed.
+		if [ "$(own_get guard)" = 1 ]; then
+			/usr/libexec/odac-firewall close "$iface" || { echo 'CRITICAL: cannot close the controlled network' >&2; ok=0; }
+		fi
+		/etc/init.d/odac stop || { echo 'CRITICAL: ODAC stop failed' >&2; ok=0; }
+		/etc/init.d/odac disable || ok=0
+		/etc/init.d/opennds stop || { echo 'CRITICAL: openNDS stop failed' >&2; ok=0; }
+		/etc/init.d/opennds disable || ok=0
+		replace_file "$opennds_before" /etc/config/opennds || { echo 'CRITICAL: openNDS configuration restore failed' >&2; ok=0; }
+		for section in $sections; do
+			if uci -q get "firewall.$section" >/dev/null; then
+				uci delete "firewall.$section" || ok=0
+			fi
+		done
+		uci commit firewall || ok=0
+		uci set odac.main.enabled=0 && uci commit odac || ok=0
+		if [ -f "$retired_before" ]; then
+			replace_file "$retired_before" "$retired" || ok=0
+		fi
+		fw4 reload || { echo 'CRITICAL: firewall reload failed' >&2; ok=0; }
+		rm -rf "${stage:-}"
+		if [ "$ok" = 1 ]; then
+			for section in $sections; do own_unset "firewall_sha256_$section"; done
+			own_unset firewall_sections
+			own_set opennds_managed 0
+			own_unset enable_pending
+			rm -f "$opennds_before" "$retired_before"
+			echo 'odac-setup: rolled back; controlled network stays closed' >&2
+		else
+			echo 'odac-setup: rollback incomplete; ownership kept. Run "odac-setup --disable".' >&2
+		fi
+	fi
+	rmdir /var/lock/odac-setup.lock 2>/dev/null || true
+	exit "$rc"
 }
 trap rollback EXIT
 trap 'exit 1' HUP INT TERM
-# First durable mutation is the fail-closed guard, before openNDS can grant.
+
+# Ownership is recorded before the first mutation, so an interruption at any
+# later point is recoverable by --disable instead of leaving unowned state.
+own_set iface "$iface"
+own_set zone "$zone"
+own_set network "$network"
+own_set gateway "$gateway"
+own_set enable_pending 1
+
+# --- apply ------------------------------------------------------------------
+
+# First mutation is the fail-closed guard, before openNDS can grant.
 # shellcheck disable=SC2046 # one argument per configured upstream address
 /usr/libexec/odac-firewall init "$iface" "$gateway" "$http" "$https" $(uci -q get odac.main.upstream || true)
+own_set guard 1
+
 /etc/init.d/odac stop
 /etc/init.d/opennds stop
 /etc/init.d/opennds disable
-stage="$backup/stage"
-mkdir "$stage"
-for file in odac opennds uhttpd firewall; do cp -p "$backup/$file" "$stage/$file"; done
+
+# Stage the configuration in a scratch directory.
+stage=$(mktemp -d /etc/odac/stage-XXXXXXXX)
+cp -p /etc/config/odac "$stage/odac"
+cp -p /etc/config/opennds "$stage/opennds"
+cp -p /etc/config/firewall "$stage/firewall"
 UCI() { uci -c "$stage" "$@"; }
+
+UCI set opennds.@opennds[0].enabled=1
 UCI set opennds.@opennds[0].gatewayinterface="$iface"
 UCI set opennds.@opennds[0].gatewayport=2050
 UCI set opennds.@opennds[0].login_option_enabled=0
@@ -68,23 +277,29 @@ UCI set opennds.@opennds[0].allow_preemptive_authentication=1
 UCI set opennds.@opennds[0].fasport="$http"
 UCI set opennds.@opennds[0].faspath=/cgi-bin/landing
 UCI set opennds.@opennds[0].fas_secure_enabled=1
-UCI set opennds.@opennds[0].fwhook_enabled=1
+# No fw4 hook, no fw4 input rule, no DNS/DHCP-114 rewriting (see the
+# odac-opennds init script and configuration).
+UCI set opennds.@opennds[0].fwhook_enabled=0
+UCI set opennds.@opennds[0].users_to_router_passthrough=1
+UCI set opennds.@opennds[0].gatewayfqdn=disable
+UCI set opennds.@opennds[0].dhcp_default_url_enable=0
 UCI set opennds.@opennds[0].faskey="$(openssl rand -hex 32)"
 UCI -q delete opennds.@opennds[0].fasremoteip || true
 UCI -q delete opennds.@opennds[0].fasremotefqdn || true
 UCI -q delete opennds.@opennds[0].users_to_router || true
 # users_to_router is a list option; setting it as a string makes add_list fail.
 UCI add_list opennds.@opennds[0].users_to_router="allow tcp port $https"
+
 # fw4 script includes run outside the inet fw4 table.
 UCI set firewall.odac_guard=include
 UCI set firewall.odac_guard.type=script
 UCI set firewall.odac_guard.path=/etc/odac/firewall-include
 UCI set firewall.odac_guard.fw4_compatible=1
 for item in dns dhcp http https nds; do
- UCI set firewall.odac_$item=rule
- UCI set firewall.odac_$item.src="$zone"
- UCI set firewall.odac_$item.target=ACCEPT
- UCI set firewall.odac_$item.family=ipv4
+	UCI set firewall.odac_$item=rule
+	UCI set firewall.odac_$item.src="$zone"
+	UCI set firewall.odac_$item.target=ACCEPT
+	UCI set firewall.odac_$item.family=ipv4
 done
 UCI set firewall.odac_dns.proto='tcp udp'; UCI set firewall.odac_dns.dest_port=53
 UCI set firewall.odac_dhcp.proto=udp; UCI set firewall.odac_dhcp.src_port=68; UCI set firewall.odac_dhcp.dest_port=67
@@ -93,13 +308,29 @@ UCI set firewall.odac_https.proto=tcp; UCI set firewall.odac_https.dest_port="$h
 UCI set firewall.odac_nds.proto=tcp; UCI set firewall.odac_nds.dest_port=2050
 UCI set odac.main.enabled=1
 UCI commit
-for file in odac opennds firewall; do
- cp -p "$stage/$file" "/etc/config/$file.odac-new"
- mv "/etc/config/$file.odac-new" "/etc/config/$file"
+
+# Record the exact content of every section before it becomes live. "uci
+# show" prints the same text for the staged and the installed file, so the
+# removal path can verify ownership even after an interruption.
+for section in $sections; do
+	snapshot=$(UCI show "firewall.$section")
+	digest=$(printf '%s\n' "$snapshot" | sha256sum)
+	own_set "firewall_sha256_$section" "${digest%% *}"
 done
-# Closed standalone guard is already installed. Remove only the validated,
-# backed-up retirement file before committing the replacement fw4 ruleset.
-if [ -f "$backup/retired.nft" ]; then rm "$retired"; fi
+own_set firewall_sections "$sections"
+own_set opennds_managed 1
+
+for file in odac opennds firewall; do
+	replace_file "$stage/$file" "/etc/config/$file"
+done
+rm -rf "$stage"
+stage=''
+
+# Closed standalone guard is already installed. The retired file was saved
+# above and is restored by rollback.
+rm -f "$retired"
+own_unset retired_guard
+
 fw4 check
 fw4 reload
 /usr/libexec/odac-config
@@ -116,12 +347,39 @@ served=$(printf '' | openssl s_client -connect "$gateway:$https" -servername "$h
 configured=$(openssl x509 -in "$cert" -noout -fingerprint -sha256)
 [ -n "$served" ] || { echo 'Portal HTTPS listener did not present a certificate' >&2; exit 1; }
 [ "$served" = "$configured" ] || { echo 'Portal HTTPS listener served a different certificate' >&2; exit 1; }
+# The request itself must succeed over TLS. A failure here means the portal
+# is not reachable or the TLS chain is broken; it is never downgraded to a
+# warning and the portal is never served in plain HTTP as a workaround.
 curl --fail --silent --show-error --retry 3 --retry-connrefused --retry-delay 1 --retry-max-time 20 --max-time 10 --noproxy '*' \
  --cacert "$cert" --resolve "$host:$https:$gateway" "https://$host:$https/" >/dev/null 2>&1 \
- || echo 'Warning: portal HTTPS request was not trusted by the local CA; the listener certificate matches the operator certificate' >&2
-ndsctl json >/dev/null
+ || { echo 'Portal HTTPS request failed; the portal is not usable over TLS' >&2; exit 1; }
+# procd start returns before openNDS has opened its control socket.
+# Retry startup failures with a fixed limit; retain probe errors for diagnosis.
+nds_attempts=0
+until ndsctl json >/dev/null; do
+	nds_attempts=$((nds_attempts + 1))
+	[ "$nds_attempts" -lt 30 ] ||
+		{ echo "openNDS did not answer after 30 control-socket probes; check that $iface has link" >&2; exit 1; }
+	sleep 1
+done
 nft list table inet odac_guard >/dev/null
-printf '%s\n' "$backup" > /etc/odac/last-setup.new
-mv /etc/odac/last-setup.new /etc/odac/last-setup
+
+# The management plane must still be reachable and unaffected. openNDS
+# installs an input chain at priority -100 that rejects router-bound
+# traffic; verify the management interface is not inside its scope.
+mgmt_iface=$(uci -q get network.lan.device || echo br-lan)
+if [ "$mgmt_iface" != "$iface" ]; then
+	if nft list table ip nds_filter 2>/dev/null | grep -q "iifname \"$mgmt_iface\""; then
+		echo "CRITICAL: openNDS captured the management interface $mgmt_iface" >&2
+		exit 1
+	fi
+fi
+# The admission backend must not have touched the uplink configuration.
+[ "$(uci -q get network.wan6.proto || echo absent)" = "$wan6_before" ] ||
+	{ echo 'CRITICAL: network.wan6.proto changed during activation' >&2; exit 1; }
+
 success=1
-printf 'ODAC enabled. Backup: %s\n' "$backup"
+own_set odac_active 1
+own_unset enable_pending
+rm -f "$opennds_before" "$retired_before"
+printf 'ODAC enabled on %s. Management interface %s is outside the controlled network.\n' "$iface" "$mgmt_iface"

@@ -115,6 +115,7 @@ struct json_object *core_restore(struct odac *c, struct json_object *p);
 
 /* db.c */
 int db_init(struct odac *c);
+int db_apply_limit(struct odac *c);
 sqlite3_stmt *db_prepare(struct odac *c, const char *sql);
 int db_exec(struct odac *c, const char *sql);
 long long db_scalar(struct odac *c, const char *sql, long long arg);

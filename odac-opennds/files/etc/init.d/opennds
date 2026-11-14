@@ -1,0 +1,57 @@
+#!/bin/sh /etc/rc.common
+# Gated openNDS service for the ODAC admission backend.
+#
+# Differences from the stock routing/opennds init script, and why:
+#   - The package postinst starts every installed init script. The stock
+#     start_service has no enabled check, so the daemon start alone is not a
+#     sufficient gate. Here nothing at all happens unless ODAC owns the
+#     instance and its fail-closed guard already protects the exact
+#     controlled interface.
+#   - "libopennds.sh ipv6_routing block|allow" is never called. It sets
+#     network.wan6.proto=none, reverts all pending network changes and reloads
+#     the network. The ODAC guard drops IPv6 on the controlled interface.
+#   - "libopennds.sh users_to_router" is never called. It inserts an accept
+#     rule into the fw4 input chain; ODAC's own firewall rules admit only the
+#     portal, DNS and DHCP ports instead.
+START=15
+STOP=99
+USE_PROCD=1
+OPTIONS="-f"
+
+service_data() {
+	/usr/bin/opennds -v
+}
+
+odac_admission_ready() {
+	[ -x /usr/libexec/odac-opennds-check ] || {
+		logger -t odac-opennds 'not started: DNS isolation check is missing'
+		return 1
+	}
+	/usr/libexec/odac-opennds-check || {
+		logger -t odac-opennds 'not started: openNDS configuration requires shared DNS changes'
+		return 1
+	}
+	[ "$(uci -q get opennds.@opennds[0].odac_backend)" = 1 ] || return 1
+	[ "$(uci -q get opennds.@opennds[0].enabled)" = 1 ] || return 1
+	[ "$(uci -q get odac.main.enabled)" = 1 ] || return 1
+	local iface
+	iface=$(uci -q get odac.main.interface) || return 1
+	case "$iface" in ''|*[!a-zA-Z0-9_.-]*) return 1;; esac
+	[ "${#iface}" -le 15 ] || return 1
+	[ "$(uci -q get opennds.@opennds[0].gatewayinterface)" = "$iface" ] || return 1
+	# The guard table must exist and protect exactly this interface.
+	nft get element inet odac_guard controlled "{ \"$iface\" }" >/dev/null 2>&1
+}
+
+start_service() {
+	if ! odac_admission_ready; then
+		logger -t odac-opennds 'not started: ODAC has not activated admission on a guarded interface'
+		return 0
+	fi
+	procd_open_instance
+	procd_set_param command /usr/bin/opennds $OPTIONS
+	procd_set_param respawn 150 10 10
+	procd_set_param term_timeout 60
+	procd_set_param stdout 1
+	procd_close_instance
+}

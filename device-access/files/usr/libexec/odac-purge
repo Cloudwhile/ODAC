@@ -1,0 +1,111 @@
+#!/bin/sh
+# Explicit offline data cleanup. Network retirement belongs to odac-remove;
+# this command never deletes firewall rules, guards, keys or backup directories.
+set -eu
+umask 077
+
+[ "$(id -u)" = 0 ] || { echo 'Root required' >&2; exit 1; }
+. /usr/libexec/odac-ownership
+fail() { echo "odac-purge: $*" >&2; exit 1; }
+
+mode=''
+confirm_data=0
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--dry-run|--backup|--confirm)
+			[ -z "$mode" ] || fail 'Choose exactly one operation'
+			mode=${1#--};;
+		--confirm-data) confirm_data=1;;
+		-h|--help)
+			echo 'Usage: odac-purge --dry-run | --backup | --confirm --confirm-data'
+			exit 0;;
+		*) fail "Unknown argument: $1";;
+	esac
+	shift
+done
+[ -n "$mode" ] || fail 'Choose --dry-run, --backup or --confirm'
+[ "$confirm_data" = 0 ] || [ "$mode" = confirm ] || fail '--confirm-data requires --confirm'
+
+ownership_file=$(odac_ownership_file)
+guard_file=/etc/nftables.d/90-odac-retired.nft
+# Fixed package data only. Never traverse /etc/odac or follow a custom DB path.
+data_paths='/etc/odac/odac.db
+/etc/odac/odac.db-wal
+/etc/odac/odac.db-shm
+/etc/config/odac'
+
+list_data() {
+	for path in $data_paths; do
+		[ -e "$path" ] || [ -L "$path" ] || continue
+		printf '  %s\n' "$path"
+	done
+}
+list_retained() {
+	echo 'Retained: ownership record, firewall sections, protective guards, TLS keys,'
+	echo '          certificates, backups, administrator files and upstream authentication scripts.'
+	for section in $(odac_ownership_get firewall_sections); do
+		printf '  firewall.%s (retained; retire network resources first)\n' "$section"
+	done
+	if [ -e "$guard_file" ]; then
+		printf '  %s (protective guard retained)\n' "$guard_file"
+	fi
+}
+
+echo 'Data and configuration files selected for cleanup:'
+list_data
+list_retained
+[ "$mode" != dry-run ] || exit 0
+if [ "$mode" = confirm ] && [ "$confirm_data" != 1 ]; then
+	fail 'Use --confirm-data to authorise deletion of the listed database files and ODAC configuration'
+fi
+
+# Share the activation lock. An interrupted operation requires manual review;
+# never steal a stale lock or allow simultaneous activation and data removal.
+mkdir /var/lock/odac-setup.lock 2>/dev/null || fail 'Another lifecycle operation is running or needs recovery'
+trap 'rmdir /var/lock/odac-setup.lock' EXIT
+trap 'exit 1' HUP INT TERM
+
+[ "$(odac_ownership_get odac_active)" != 1 ] || fail 'ODAC is still active; retire it before cleanup'
+[ "$(odac_ownership_get opennds_managed)" != 1 ] || fail 'Managed openNDS has not been retired'
+[ "$(odac_ownership_get guard)" != 1 ] || fail 'Active guard has not been retired'
+[ -z "$(odac_ownership_get firewall_sections)" ] || fail 'Recorded firewall sections have not been retired'
+[ "$(uci -q get odac.main.enabled || true)" != 1 ] || fail 'ODAC is enabled; retire it before cleanup'
+if [ -x /etc/init.d/odac ]; then
+	rc=0
+	/etc/init.d/odac running >/dev/null 2>&1 || rc=$?
+	case "$rc" in
+		0) fail 'ODAC service is still running';;
+		1) :;;
+		*) fail 'Cannot determine ODAC service state';;
+	esac
+fi
+# A surviving daemon after package removal must not lose its SQLite files.
+command -v pidof >/dev/null 2>&1 || fail 'pidof is required to check for a surviving daemon'
+if pidof odacd >/dev/null 2>&1; then
+	fail 'An odacd process is still running'
+fi
+
+# Reject symlinks rather than copying or deleting an administrator's target.
+for path in /etc/odac /etc/config /etc/nftables.d "$ownership_file" "$guard_file" $data_paths; do
+	[ ! -L "$path" ] || fail "Refusing symbolic link: $path"
+done
+for path in $data_paths; do
+	[ ! -e "$path" ] || [ -f "$path" ] || fail "Not a regular file: $path"
+done
+
+# Always make a private offline snapshot before deletion. WAL and SHM accompany
+# the database; retaining only the main SQLite file could omit committed data.
+mkdir -p /etc/odac
+backup=$(mktemp -d /etc/odac/purge-backup-XXXXXXXX)
+printf 'Backup directory: %s\n' "$backup"
+for path in $data_paths "$ownership_file" "$guard_file"; do
+	[ -f "$path" ] || continue
+	cp -p "$path" "$backup/$(basename "$path")"
+	printf '%s\n' "$path" >> "$backup/paths.txt"
+done
+[ "$mode" != backup ] || { echo 'Backup complete. Source files retained.'; exit 0; }
+
+for path in $data_paths; do
+	rm -f "$path"
+done
+echo 'Listed ODAC data and configuration removed; backup and network recovery records retained.'

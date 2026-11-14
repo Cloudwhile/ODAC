@@ -1,0 +1,232 @@
+#!/bin/sh
+# procd owns the worker after the short RPC exits. Each job keeps its own input,
+# uploads and result; completed results are retained for the latest eight jobs.
+set -eu
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C
+root=/var/run/odac-config-job
+fail() { printf '{"ok":false,"error":{"code":"%s","message":"%s"}}\n' "$1" "$2"; exit 1; }
+[ "$(id -u)" = 0 ] || fail PERMISSION 'Root required'
+[ ! -L "$root" ] || fail PERMISSION 'Unsafe job directory'
+mkdir -p "$root"
+[ "$(ls -ldn "$root" | awk '{print $3}')" = 0 ] || fail PERMISSION 'Job directory must be root owned'
+chmod 700 "$root"
+set +u
+. /usr/share/libubox/jshn.sh
+valid_id() { [ "${#1}" = 32 ] && case "$1" in *[!0-9a-f]*) return 1;; *) return 0;; esac; }
+owned_lock() { [ "$(cat "$root/busy/id" 2>/dev/null)" = "$id" ]; }
+release_lock() {
+ owned_lock || return 0
+ rm -f "$root/busy/id"
+ rmdir "$root/busy" 2>/dev/null || true
+}
+error_result() {
+ printf '{"ok":false,"error":{"code":"%s","message":"%s"}}\n' "$1" "$2" > "$job/result.new"
+ mv "$job/result.new" "$job/result"
+}
+prune() {
+ count=0
+ # Only generated directories with completed results are eligible. A running
+ # job is never removed. The directory is private and names contain no spaces.
+ for entry in $(ls -dt "$root"/* 2>/dev/null); do
+  valid_id "${entry##*/}" || continue
+  [ -f "$entry/result" ] || continue
+  count=$((count + 1))
+  [ "$count" -le 8 ] || rm -rf "$entry"
+ done
+}
+# Return 0 only for positively observed absence. A failed ubus call, malformed
+# JSON or a live recorded process is uncertainty and must preserve the lock.
+worker_dead() {
+ if [ -f "$job/pid" ]; then
+  worker_pid=$(cat "$job/pid")
+  case "$worker_pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$worker_pid" 2>/dev/null && return 1
+ fi
+ state=$(ubus call service list '{"name":"odac-config-job"}') || return 1
+ json_load "$state" || return 1
+ json_load "{\"state\":$state}" || return 1
+ json_get_type state_kind state
+ [ "$state_kind" = object ] || return 1
+ json_select state
+ json_get_keys service_keys
+ if [ -n "$service_keys" ]; then
+  [ "$service_keys" = odac-config-job ] || return 1
+  json_select odac-config-job && json_select instances && json_select worker || return 1
+  json_get_type state_kind running
+  [ "$state_kind" = boolean ] || return 1
+  json_get_var running running
+  [ "$running" = 0 ] || return 1
+ fi
+ [ ! -d /var/lock/odac-setup.lock ]
+}
+recover_stale() {
+ if [ -f "$job/result" ]; then
+  if owned_lock && worker_dead; then release_lock; fi
+  return 0
+ fi
+ started=$(cat "$job/started" 2>/dev/null) || return 0
+ case "$started" in ''|*[!0-9]*) return 0;; esac
+ now=$(date +%s) || return 0
+ [ "$((now - started))" -ge 30 ] || return 0
+ mkdir "$job/recover" 2>/dev/null || return 0
+ if worker_dead && owned_lock && [ ! -f "$job/result" ]; then
+  error_result INTERRUPTED 'Configuration worker exited without a result; verify settings before retrying'
+  rm -f "$job/params"
+  rm -rf "$job/upload"
+  release_lock
+ fi
+ rmdir "$job/recover" 2>/dev/null || true
+}
+
+if [ "${1:-}" = --run ]; then
+ id=${2:-}; method=${3:-}
+ valid_id "$id" || fail INVALID 'Invalid job identifier'
+ case "$method" in network_update|upload_cert) :;; *) fail METHOD 'Invalid job method';; esac
+ job=$root/$id
+ [ -d "$job" ] && [ ! -L "$job" ] && owned_lock || exit 1
+ # Prevent duplicate procd starts from applying the same transaction twice.
+ mkdir "$job/worker" 2>/dev/null || exit 1
+ printf '%s\n' "$$" > "$job/pid"
+ child=''; timer=''; interrupted=0
+ terminate() {
+  interrupted=1
+  [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true
+ }
+ trap terminate HUP INT TERM
+ set -- "$method"
+ [ "$method" != upload_cert ] || set -- "$method" --upload-dir "$job/upload"
+ /usr/libexec/odac-network-config "$@" < "$job/params" > "$job/output" 2> "$job/error.log" &
+ child=$!
+ # No timeout applet dependency and no KILL escalation: a TERM-triggered EXIT
+ # trap may need time to restore services. procd also gets a long stop grace.
+ (
+  sleeper=''
+  trap '[ -z "$sleeper" ] || kill -TERM "$sleeper" 2>/dev/null; exit 0' HUP INT TERM
+  sleep 180 &
+  sleeper=$!
+  wait "$sleeper" || exit 0
+  kill -TERM "$child" 2>/dev/null || true
+ ) &
+ timer=$!
+ rc=0
+ wait "$child" || rc=$?
+ # A signal interrupts shell wait before the child has finished its rollback.
+ # Keep waiting until it is gone; do not publish completion or release busy.
+ while kill -0 "$child" 2>/dev/null; do
+  wait "$child" || rc=$?
+ done
+ child=''
+ kill -TERM "$timer" 2>/dev/null || true
+ wait "$timer" 2>/dev/null || true
+ timer=''
+ trap '' HUP INT TERM
+ result=$(head -c 65537 "$job/output")
+ kind=''; ok=''
+ if [ "${#result}" -le 65536 ] && json_load "$result"; then
+  json_get_type kind ok || kind=''
+  json_get_var ok ok || ok=''
+ fi
+ if [ "$kind" != boolean ]; then
+  error_result BAD_RESPONSE 'Configuration worker did not return a valid result; verify current settings'
+ elif [ "$rc" -ne 0 ] && [ "$ok" = 1 ]; then
+  error_result APPLY 'Configuration worker failed after reporting success; verify current settings'
+ elif [ "$interrupted" = 1 ]; then
+  error_result INTERRUPTED 'Configuration worker was interrupted; verify current settings'
+ else
+  printf '%s\n' "$result" > "$job/result.new"
+  mv "$job/result.new" "$job/result"
+ fi
+ rm -f "$job/params" "$job/output" "$job/pid"
+ rm -rf "$job/upload"
+ prune
+ release_lock
+ exit 0
+fi
+
+input=$(head -c 65537)
+[ "${#input}" -le 65536 ] || fail TOO_LARGE 'Request too large'
+# Validate standalone first: otherwise input can escape the wrapper object.
+json_load "$input" || fail JSON 'Invalid request'
+json_load "{\"params\":$input}" || fail JSON 'Invalid request'
+json_get_type kind params
+[ "$kind" = object ] || fail PARAMS 'Params must be an object'
+json_select params
+case "${1:-}" in
+ status)
+  json_get_keys keys
+  [ "$keys" = job ] || fail INVALID 'A job identifier is required'
+  json_get_type kind job; [ "$kind" = string ] || fail INVALID 'Invalid job identifier'
+  json_get_var id job
+  valid_id "$id" || fail INVALID 'Invalid job identifier'
+  job=$root/$id
+  [ -d "$job" ] && [ ! -L "$job" ] || fail EXPIRED 'Job result expired; reload settings to verify current state'
+  recover_stale
+  if [ -f "$job/result" ]; then
+   result=$(cat "$job/result") || fail EXPIRED 'Job result expired'
+   printf '{"ok":true,"data":{"done":true,"result":%s}}\n' "$result"
+  else
+   printf '%s\n' '{"ok":true,"data":{"done":false}}'
+  fi
+  ;;
+ network_update|upload_cert)
+  method=$1
+  # Recovery may parse service JSON and replace the jshn tree. Request bytes
+  # have already been validated and are stored unchanged below.
+  if [ -d "$root/busy" ]; then
+   id=$(cat "$root/busy/id" 2>/dev/null) || fail BUSY 'Configuration startup is in progress'
+   valid_id "$id" || fail BUSY 'Configuration lock requires operator review'
+   job=$root/$id
+   recover_stale
+  fi
+  mkdir "$root/busy" 2>/dev/null || fail BUSY 'A configuration transaction is already running'
+  accepted=0; job=''; id=''
+  abort_start() {
+   [ "$accepted" = 0 ] || return 0
+   [ -z "$job" ] || rm -rf "$job"
+   rm -f "$root/busy/id"
+   rmdir "$root/busy" 2>/dev/null || true
+  }
+  trap abort_start EXIT
+  trap 'exit 1' HUP INT TERM
+  id=$(openssl rand -hex 16) || fail IO 'Cannot allocate job identifier'
+  valid_id "$id" || fail IO 'Invalid generated job identifier'
+  mkdir "$root/$id" || fail IO 'Cannot allocate job directory'
+  job=$root/$id
+  printf '%s\n' "$input" > "$job/params"
+  date +%s > "$job/started"
+  printf '%s\n' "$id" > "$root/busy/id"
+  if [ "$method" = upload_cert ]; then
+   mkdir "$job/upload"
+   mv /tmp/odac-upload-cert.pem "$job/upload/cert.pem" || fail UPLOAD 'Certificate upload is missing'
+   mv /tmp/odac-upload-key.pem "$job/upload/key.pem" || fail UPLOAD 'Private key upload is missing'
+  fi
+  json_init
+  json_add_string name odac-config-job
+  json_add_object instances
+  json_add_object worker
+  json_add_array command
+  json_add_string '' /usr/libexec/odac-config-job
+  json_add_string '' --run
+  json_add_string '' "$id"
+  json_add_string '' "$method"
+  json_close_array
+  json_add_int term_timeout 86400
+  json_add_boolean stderr 1
+  json_close_object
+  json_close_object
+  # Once submitted, failure/interrupt may mean an uncertain ubus reply rather
+  # than no process. Preserve the job until absence is positively established.
+  accepted=1
+  trap '' HUP INT TERM
+  if ! ubus call service set "$(json_dump)" >/dev/null; then
+   if worker_dead; then
+    accepted=0
+    fail UNAVAILABLE 'Could not start configuration worker'
+   fi
+  fi
+  printf '{"ok":true,"data":{"job":"%s"}}\n' "$id"
+  ;;
+ *) fail METHOD 'Unknown configuration job method';;
+esac

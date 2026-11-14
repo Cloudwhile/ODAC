@@ -28,6 +28,91 @@ case "$network:$zone:$iface" in lan:*|wan:*|wan6:*|*:lan:*|*:wan:*|*:br-lan|*:et
 [ "$(uci -q get network.$network.ipaddr)" = "$gateway" ] || fail 'Gateway does not match static network'
 mask=$(uci -q get network.$network.netmask) || fail 'Explicit IPv4 netmask required'
 [ -d "/sys/class/net/$iface" ] || fail 'Controlled device is not present'
+
+# --- management plane isolation ----------------------------------------------
+# The controlled interface must not share a bridge, a physical port or any
+# other layer-2 domain with the management network. Checking only the
+# interface name is not enough: "br-odac" and "br-lan" may be two ports of
+# the same bridge, and a VLAN interface may carry the management traffic.
+# Every member of the controlled bridge is inspected, and every member of
+# the management bridge is inspected, so a shared port is detected.
+
+# Collect the physical ports of a bridge, if the interface is one.
+bridge_ports() {
+	# $1: interface name. Prints one port per line, or nothing.
+	[ -d "/sys/class/net/$1/brif" ] || return 0
+	for entry in /sys/class/net/"$1"/brif/*; do
+		[ -e "$entry" ] || continue
+		name=${entry##*/}
+		printf '%s\n' "$name"
+	done
+}
+
+is_bridge() { [ -d "/sys/class/net/$1/brif" ]; }
+
+# The management interface is taken from the lan network, not from a fixed
+# name, so a renamed or VLAN based management network is handled too.
+mgmt_device=$(uci -q get network.lan.device || echo '')
+[ -n "$mgmt_device" ] || mgmt_device=br-lan
+# A management network may list several devices.
+mgmt_devices=$(uci -q get network.lan.device || echo br-lan)
+mgmt_devices="$mgmt_devices $(uci -q get network.lan.ifname || echo '')"
+
+# The controlled interface must not be the management interface itself.
+for mgmt in $mgmt_devices; do
+	[ -n "$mgmt" ] || continue
+	[ "$mgmt" != "$iface" ] || fail "Controlled interface $iface is the management interface"
+done
+
+# A controlled bridge must not contain a management bridge or port, and a
+# controlled port must not be a member of a management bridge.
+for mgmt in $mgmt_devices; do
+	[ -n "$mgmt" ] || continue
+	[ -d "/sys/class/net/$mgmt" ] || continue
+	for port in $(bridge_ports "$iface"); do
+		[ "$port" != "$mgmt" ] || fail "Controlled bridge $iface contains the management device $mgmt"
+		# A management bridge that lists the controlled port is a shared
+		# layer-2 domain.
+		if is_bridge "$mgmt" && [ -e "/sys/class/net/$mgmt/brif/$port" ]; then
+			fail "Controlled port $port is a member of the management bridge $mgmt"
+		fi
+	done
+	# The management bridge must not contain the controlled interface.
+	if is_bridge "$mgmt" && [ -e "/sys/class/net/$mgmt/brif/$iface" ]; then
+		fail "Controlled interface $iface is a member of the management bridge $mgmt"
+	fi
+done
+
+# VLAN and alias interfaces that carry the controlled device inherit its
+# addresses. A management VLAN on the same physical port shares the domain.
+for entry in /sys/class/net/*; do
+	[ -e "$entry" ] || continue
+	name=${entry##*/}
+	[ "$name" != "$iface" ] || continue
+	# Skip interfaces that are not derived from the controlled device.
+	case "$name" in
+		"$iface".*) : ;;
+		*) continue;;
+	esac
+	# A management device that is one of these aliases is a conflict.
+	for mgmt in $mgmt_devices; do
+		[ -n "$mgmt" ] || continue
+		case "$mgmt" in
+			"$iface".*) fail "Management interface $mgmt is an alias of the controlled device $iface";;
+		esac
+	done
+done
+
+# The controlled interface must not be the WAN uplink either.
+for wan in wan wan6; do
+	wan_device=$(uci -q get "network.$wan.device" || echo '')
+	[ -n "$wan_device" ] || continue
+	for port in $(bridge_ports "$iface"); do
+		[ "$port" != "$wan_device" ] || fail "Controlled bridge $iface contains the WAN device $wan_device"
+	done
+	[ "$wan_device" != "$iface" ] || fail 'Controlled interface is the WAN uplink'
+done
+
 retired=/etc/nftables.d/90-odac-retired.nft
 if [ -e "$retired" ] || [ -L "$retired" ]; then
  [ -f "$retired" ] && [ ! -L "$retired" ] || fail 'Retired guard must be a regular file'
@@ -114,6 +199,40 @@ config_load firewall
 config_foreach check_zone zone
 config_foreach check_offload defaults
 [ "$zone_found" = 1 ] || fail 'Exactly one dedicated isolated zone required'
+
+# Configuration edits may be staged before a TLS identity or admission daemon
+# is installed. Isolation checks above still apply; activation uses the full
+# preflight below.
+if [ "${1:-}" = --config ]; then
+ http=$(get portal_port); https=$(get portal_https_port)
+ for port in "$http" "$https"; do
+  case "$port" in ''|*[!0-9]*) fail 'Invalid portal port';; esac
+  [ "$port" -gt 1024 ] && [ "$port" -le 65535 ] || fail 'Use unprivileged dedicated portal ports'
+ done
+ [ "$http" != "$https" ] || fail 'HTTP and HTTPS ports must differ'
+ [ "$http" != 2050 ] && [ "$https" != 2050 ] || fail 'Port 2050 is reserved for openNDS gateway'
+ host=$(get portal_hostname)
+ case "$host" in ''|*[!a-zA-Z0-9.-]*|.*|*.) [ -z "$host" ] || fail 'Invalid portal hostname';; esac
+ exit 0
+fi
+
+# --- admission backend ---------------------------------------------------------
+# Only the dedicated odac-opennds package is used. Its init script starts
+# nothing until ODAC owns it and never changes WAN6 or the fw4 table. The
+# stock opennds package (whose postinst start changes network.wan6 and may
+# capture br-lan) is never adopted, reconfigured or stopped by ODAC.
+apk info -e odac-opennds >/dev/null 2>&1 ||
+	fail 'Admission backend missing: install the odac-opennds package explicitly (stock opennds is not supported)'
+! apk info -e opennds >/dev/null 2>&1 ||
+	fail 'The stock opennds package is installed; ODAC never adopts or reconfigures it'
+[ "$(uci -q get opennds.@opennds[0].odac_backend || true)" = 1 ] ||
+	fail '/etc/config/opennds does not belong to the odac-opennds backend'
+grep -q 'odac_admission_ready' /etc/init.d/opennds ||
+	fail '/etc/init.d/opennds is not the gated odac-opennds service'
+[ -x /usr/libexec/odac-opennds-check ] ||
+	fail 'The openNDS shared-DNS isolation checker is missing; reinstall odac-opennds'
+/usr/libexec/odac-opennds-check ||
+	fail 'openNDS configuration requires shared DNS/DHCP changes unsupported by ODAC'
 # Do not coexist with bypass grants from another openNDS policy.
 for option in trustedmac preemptivemac; do
  [ -z "$(uci -q get opennds.@opennds[0].$option || true)" ] || fail "Existing openNDS $option bypasses ODAC policy"
@@ -124,6 +243,29 @@ help=$(ndsctl -h 2>&1 || true)
 printf '%s' "$help" | grep -q 'uploadrate' || fail 'Unsupported ndsctl auth API'
 printf '%s' "$help" | grep -q 'json' || fail 'Unsupported ndsctl JSON API'
 /usr/sbin/uhttpd -h 2>&1 | grep -q -- '-s' || fail 'uhttpd TLS support required'
+
+# --- TLS provider ------------------------------------------------------------
+# ODAC does not depend on a libustream variant, so the system's provider is
+# whatever the operator already has. The portal is served over HTTPS by
+# uhttpd, which loads the provider at runtime with
+# dlopen("libustream-ssl.so"). All three upstream variants install that exact
+# path, so the file is the reliable evidence that a provider exists.
+#
+# A missing provider is a hard error here. It is never worked around by
+# falling back to plain HTTP, and the missing package is never installed
+# automatically, because that would replace an existing provider.
+if [ ! -e /lib/libustream-ssl.so ]; then
+	fail 'No TLS provider found: /lib/libustream-ssl.so is missing. Install a libustream variant (libustream-mbedtls, libustream-openssl or libustream-wolfssl) deliberately, then retry.'
+fi
+if ! apk info -W /lib/libustream-ssl.so >/dev/null 2>&1; then
+	echo 'Warning: /lib/libustream-ssl.so exists but is not owned by an installed package' >&2
+fi
+# The provider must be loadable, not merely present: a broken library makes
+# uhttpd print "SSL support not available" and silently serve plain HTTP.
+if command -v ldd >/dev/null 2>&1; then
+	ldd /lib/libustream-ssl.so >/dev/null 2>&1 ||
+		fail 'The TLS provider /lib/libustream-ssl.so is not loadable; uhttpd would fall back to plain HTTP'
+fi
 http=$(get portal_port); https=$(get portal_https_port)
 for port in "$http" "$https"; do
  case "$port" in ''|*[!0-9]*) fail 'Invalid portal port';; esac

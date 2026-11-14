@@ -1,0 +1,109 @@
+#!/bin/sh
+# ODAC ownership and lifecycle state.
+#
+# Every resource ODAC creates is recorded here, so that uninstall and purge
+# can distinguish "owned by ODAC" from "belongs to the administrator or to
+# another service". This file is the single source of truth for ownership;
+# no other script may infer ownership from a file name or from a value that
+# happens to be present in /etc/config.
+#
+# State file: /etc/odac/ownership
+# Format: one "<key> <value>" record per line, LF separated, root owned 0600.
+# The file is created atomically (write to a temporary file, then rename).
+#
+# Keys:
+#   iface          controlled interface ODAC was configured for
+#   zone           controlled firewall zone
+#   network        controlled network section
+#   gateway        controlled gateway address
+#   opennds_managed 1 when ODAC owns the openNDS configuration it wrote
+#   enable_pending 1 while an activation is in progress or was interrupted
+#   guard          1 while the fail-closed guard table is installed
+#   retired_guard  1 while the durable retired guard file is installed
+#   firewall_sections  space separated list of firewall sections ODAC created
+#   firewall_sha256_<section>  content hash of each recorded section
+#   odac_active    1 after a fully verified activation
+#
+# The helpers below never write outside /etc/odac and never remove a file
+# that is not recorded here.
+
+ODAC_OWNERSHIP_DIR=${ODAC_OWNERSHIP_DIR:-/etc/odac}
+ODAC_OWNERSHIP_FILE=$ODAC_OWNERSHIP_DIR/ownership
+
+odac_ownership_file() {
+	printf '%s\n' "$ODAC_OWNERSHIP_FILE"
+}
+
+odac_ownership_validate_key() {
+	case "${1:-}" in
+		''|*[!a-zA-Z0-9_]*) echo 'Invalid ownership key' >&2; return 1;;
+	esac
+}
+
+# Subshells keep helper variables and umask out of their caller. In particular,
+# setup's TLS key path must survive calls that store ownership keys.
+odac_ownership_get() (
+	odac_ownership_validate_key "$1" || exit 1
+	[ ! -L "$ODAC_OWNERSHIP_DIR" ] && [ ! -L "$ODAC_OWNERSHIP_FILE" ] || exit 1
+	[ -f "$ODAC_OWNERSHIP_FILE" ] || exit 0
+	awk -v key="$1" 'index($0, key " ") == 1 { value = substr($0, length(key) + 2) } END { if (value != "") print value }' "$ODAC_OWNERSHIP_FILE"
+)
+
+odac_ownership_has() {
+	[ -n "$(odac_ownership_get "$1")" ]
+}
+
+odac_ownership_update() (
+	operation=$1
+	key=$2
+	value=${3:-}
+	odac_ownership_validate_key "$key" || exit 1
+	case "$value" in
+		*'
+'*) echo 'Ownership values must be a single line' >&2; exit 1;;
+	esac
+	[ ! -L "$ODAC_OWNERSHIP_DIR" ] && [ ! -L "$ODAC_OWNERSHIP_FILE" ] || exit 1
+	if [ "$operation" = unset ] && [ ! -e "$ODAC_OWNERSHIP_FILE" ]; then exit 0; fi
+	umask 077
+	mkdir -p "$ODAC_OWNERSHIP_DIR" || exit 1
+	chmod 700 "$ODAC_OWNERSHIP_DIR" || exit 1
+	tmp=$(mktemp "$ODAC_OWNERSHIP_FILE.new.XXXXXXXX") || exit 1
+	trap 'rm -f "$tmp"' EXIT
+	trap 'exit 1' HUP INT TERM
+	if [ -f "$ODAC_OWNERSHIP_FILE" ]; then
+		sed "/^$key /d" "$ODAC_OWNERSHIP_FILE" > "$tmp" || exit 1
+	fi
+	if [ "$operation" = set ]; then
+		printf '%s %s\n' "$key" "$value" >> "$tmp" || exit 1
+	fi
+	chmod 600 "$tmp" || exit 1
+	mv "$tmp" "$ODAC_OWNERSHIP_FILE" || exit 1
+)
+
+odac_ownership_set() { odac_ownership_update set "$1" "$2"; }
+odac_ownership_unset() { odac_ownership_update unset "$1"; }
+
+odac_ownership_list() {
+	[ -f "$ODAC_OWNERSHIP_FILE" ] || return 0
+	cat "$ODAC_OWNERSHIP_FILE"
+}
+
+# odac_firewall_section_unchanged SECTION
+#
+# True when the firewall section is still exactly the one ODAC created at
+# activation time. The content hash was recorded when the section was
+# written; a mismatch means an administrator changed the section, and a
+# changed section is never deleted behind their back.
+#
+# A section without a recorded hash cannot be confirmed as ODAC's, so it
+# is reported as changed. The caller decides what to do with it.
+odac_firewall_section_unchanged() (
+	section=$1
+	odac_ownership_validate_key "$section" || exit 1
+	expected=$(odac_ownership_get "firewall_sha256_$section")
+	[ -n "$expected" ] || exit 1
+	uci -q get "firewall.$section" >/dev/null 2>&1 || exit 1
+	current=$(uci -q show "firewall.$section") || exit 1
+	actual=$(printf '%s\n' "$current" | sha256sum)
+	[ "${actual%% *}" = "$expected" ]
+)

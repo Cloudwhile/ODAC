@@ -16,4 +16,12 @@ ${CC:-cc} -std=c11 -Wall -Wextra -Werror -Wpedantic -Wconversion -Wno-sign-conve
     -DODAC_DHCP_LEASES='"/nonexistent"' \
     "$root/tests/platform_test.c" "$root"/device-access/src/platform*.c -ljson-c -o "$work/platform_test"
 ODAC_TEST_LOG="$work/log" unshare -rnm sh -c 'mount -t sysfs sysfs /sys && ip link add odactest0 type dummy && exec "$1"' sh "$work/platform_test"
-timeout 180 unshare -rnm sh "$root/tests/platform_firewall_netns.sh"
+# Run the netns test from $work too: when started as root, unshare -r maps only
+# uid 0, so files owned by another uid (a CI checkout) cannot be opened there.
+mkdir -p "$work/netns/tests" "$work/netns/device-access/files/usr/libexec"
+cp "$root/tests/platform_firewall_netns.sh" "$work/netns/tests/"
+cp "$root/tests/platform_firewall_egress.sh" "$work/netns/tests/"
+cp "$root/device-access/files/usr/libexec/odac-firewall" "$work/netns/device-access/files/usr/libexec/"
+chmod +x "$work/netns/device-access/files/usr/libexec/odac-firewall"
+timeout 180 unshare -rnm sh "$work/netns/tests/platform_firewall_netns.sh"
+timeout 180 unshare -rnm sh "$work/netns/tests/platform_firewall_egress.sh"

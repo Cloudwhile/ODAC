@@ -1,0 +1,298 @@
+#!/bin/sh
+set -eu
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+set -f
+export PATH LC_ALL=C
+fail() { printf '{"ok":false,"error":{"code":"%s","message":"%s"}}\n' "$1" "$2"; exit 1; }
+method=${1:-}
+case "$method" in settings|network_update|upload_cert) ;; *) fail METHOD 'Unknown network method';; esac
+[ "$(id -u)" = 0 ] || fail PERMISSION 'Root required'
+
+# jshn is not nounset-safe. Wrap the request to inspect its type using the
+# public named-member API; json_get_type does not support an unnamed root.
+set +u
+. /usr/share/libubox/jshn.sh
+if [ "$method" != settings ]; then
+ input=$(head -c 65537)
+ [ "${#input}" -le 65536 ] || fail TOO_LARGE 'Request too large'
+ json_load "$input" || fail JSON 'Invalid params object'
+ json_load "{\"params\":$input}" || fail JSON 'Invalid params object'
+ json_get_type root_type params
+ [ "$root_type" = object ] || fail PARAMS 'Params must be an object'
+ json_select params
+fi
+fields='interface gateway portal_hostname portal_https_port portal_port upstream'
+if [ "$method" = network_update ]; then
+ json_get_keys keys
+ for key in $keys; do
+  case " $fields " in *" $key "*) :;; *) fail INVALID 'Unsupported network setting';; esac
+  json_get_type type "$key" || fail INVALID 'Settings must be strings'
+  [ "$type" = string ] || fail INVALID 'Settings must be strings'
+  json_get_var value "$key"
+  [ "${#value}" -le 512 ] || fail INVALID 'Setting is too long'
+  case "$value" in *[!\ -~]*) fail INVALID 'Control or non-ASCII characters are not allowed';; esac
+  case "$key" in
+   interface) new_interface=$value;; gateway) new_gateway=$value;; portal_hostname) new_portal_hostname=$value;;
+   portal_https_port) new_portal_https_port=$value;; portal_port) new_portal_port=$value;; upstream) new_upstream=$value;;
+  esac
+ done
+ [ -n "$keys" ] || fail INVALID 'No settings supplied'
+elif [ "$method" = upload_cert ]; then
+ json_get_keys keys
+ [ -z "$keys" ] || fail INVALID 'Certificate upload takes no JSON fields'
+fi
+
+settings_json() {
+ enabled=$(uci -q get odac.main.enabled 2>/dev/null || echo 0)
+ [ "$enabled" = 1 ] || enabled=0
+ json_init
+ json_add_object data
+ for key in interface gateway portal_hostname upstream tls_cert; do json_add_string "$key" "$(uci -q get "odac.main.$key" 2>/dev/null || true)"; done
+ for key in portal_https_port portal_port; do value=$(uci -q get "odac.main.$key" 2>/dev/null || echo 0); case "$value" in ''|*[!0-9]*) value=0;; esac; json_add_int "$key" "$value"; done
+ json_add_boolean enabled "$enabled"
+ json_add_boolean config_enabled "$enabled"
+ # The settings method is used only after daemon RPC failed. A PID alone
+ # does not prove that its database/API is available.
+ if [ "$method" != settings ] && pidof odacd >/dev/null 2>&1; then json_add_boolean daemon_available 1; else json_add_boolean daemon_available 0; fi
+ json_close_object
+ json_add_boolean ok 1
+ json_dump
+}
+mkdir -p /var/lock
+lock=/var/lock/odac-setup.lock
+mkdir "$lock" 2>/dev/null || fail BUSY 'Configuration is changing; retry shortly'
+work=''; incoming=''
+cleanup() { [ -z "$work" ] || rm -rf "$work"; [ -z "$incoming" ] || rm -rf "$incoming"; rmdir "$lock" 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if [ "$method" = settings ]; then settings_json; exit 0; fi
+
+# Never adopt the administrator's pending edits. All our own delta files are
+# private, so a failed commit cannot later reapply candidate values on rollback.
+pending=$(uci changes) || fail UCI 'Cannot inspect pending UCI changes'
+[ -z "$pending" ] || fail BUSY 'Pending UCI changes exist; commit or discard them before updating ODAC'
+[ ! -L /etc/odac ] || fail PERMISSION 'ODAC directory cannot be a symlink'
+mkdir -p /etc/odac
+work=$(mktemp -d /etc/odac/.network-update-XXXXXXXX) || fail IO 'Cannot create transaction workspace'
+mkdir "$work/delta"
+uci() { command uci -t "$work/delta" "$@"; }
+old_iface=$(uci -q get odac.main.interface || true)
+active=$(uci -q get odac.main.enabled || echo 0)
+old_cert=$(uci -q get odac.main.tls_cert || true)
+old_key=$(uci -q get odac.main.tls_key || true)
+old_gateway=$(uci -q get odac.main.gateway || true)
+old_http=$(uci -q get odac.main.portal_port || echo 2080)
+old_https=$(uci -q get odac.main.portal_https_port || echo 8443)
+old_upstream=$(uci -q get odac.main.upstream || true)
+if [ "$active" = 1 ] && [ "${new_interface-$old_iface}" != "$old_iface" ]; then
+ fail INTERFACE 'Disable ODAC before changing its controlled interface'
+fi
+if [ "$active" = 1 ]; then
+ . /usr/libexec/odac-ownership
+ [ "$(odac_ownership_get odac_active)" = 1 ] && [ "$(odac_ownership_get iface)" = "$old_iface" ] && [ "$(odac_ownership_get opennds_managed)" = 1 ] || fail OWNERSHIP 'Active service ownership is not recorded'
+ sections=$(odac_ownership_get firewall_sections)
+ for section in odac_http odac_https; do
+  case " $sections " in *" $section "*) :;; *) fail OWNERSHIP 'Owned portal firewall rule is missing';; esac
+ done
+ for section in $sections; do odac_firewall_section_unchanged "$section" || fail OWNERSHIP 'An owned firewall section was modified'; done
+fi
+cp -p /etc/config/odac "$work/odac.before" || fail IO 'Cannot snapshot ODAC configuration'
+if [ "$active" = 1 ]; then
+ cp -p /etc/config/firewall "$work/firewall.before" && cp -p /etc/config/opennds "$work/opennds.before" && cp -p /etc/odac/ownership "$work/ownership.before" || fail IO 'Cannot snapshot active service configuration'
+fi
+new_cert=''; changed=0
+
+# A running daemon may renew online leases. Stop it before closing the guard;
+# on any failed recovery it must stay stopped rather than reopen a broken setup.
+close_old() {
+ close_failed=0
+ /etc/init.d/odac stop >/dev/null 2>&1 || close_failed=1
+ ! pidof odacd >/dev/null 2>&1 || close_failed=1
+ /usr/libexec/odac-firewall init "$old_iface" "$old_gateway" "$old_http" "$old_https" $old_upstream >/dev/null 2>&1 || close_failed=1
+ [ "$close_failed" = 0 ]
+}
+accept_runtime() {
+ # Query both control sockets rather than accepting successful procd registration.
+ printf '{}' | /usr/bin/odacctl --wait-ready | jsonfilter -e '@.ok' | grep -qx true || return 1
+ attempts=0
+ until ndsctl json >/dev/null 2>&1; do
+  attempts=$((attempts + 1)); [ "$attempts" -lt 10 ] || return 1
+  sleep 1
+ done
+ /etc/init.d/opennds running >/dev/null 2>&1 && /etc/init.d/odac running >/dev/null 2>&1 || return 1
+ iface=$(uci -q get odac.main.interface) || return 1
+ nft get element inet odac_guard controlled "{ \"$iface\" }" >/dev/null 2>&1 || return 1
+ host=$(uci -q get odac.main.portal_hostname) || return 1
+ cert=$(uci -q get odac.main.tls_cert) || return 1
+ gateway=$(uci -q get odac.main.gateway) || return 1
+ https=$(uci -q get odac.main.portal_https_port) || return 1
+ http=$(uci -q get odac.main.portal_port) || return 1
+ curl --noproxy '*' --fail --silent --show-error --connect-timeout 2 --max-time 5 "http://$gateway:$http/" >/dev/null 2>&1 || return 1
+ curl --cacert "$cert" --resolve "$host:$https:$gateway" --noproxy '*' --fail --silent --show-error --connect-timeout 2 --max-time 5 "https://$host:$https/" >/dev/null 2>&1
+}
+rollback() {
+ rc=$?
+ trap - EXIT
+ trap '' HUP INT TERM
+ set +e
+ if [ "$rc" -ne 0 ] && [ "$changed" = 1 ]; then
+  rollback_failed=0
+  if [ "$active" = 1 ]; then close_old || rollback_failed=1; fi
+  # Revert only our private deltas; never commit after restoring snapshot bytes.
+  for package in odac firewall opennds; do uci -q revert "$package" >/dev/null 2>&1 || rollback_failed=1; done
+  cp -p "$work/odac.before" /etc/config/odac || rollback_failed=1
+  if [ "$active" = 1 ]; then
+   cp -p "$work/firewall.before" /etc/config/firewall || rollback_failed=1
+   cp -p "$work/opennds.before" /etc/config/opennds || rollback_failed=1
+   cp -p "$work/ownership.before" /etc/odac/ownership || rollback_failed=1
+   fw4 check >/dev/null 2>&1 && fw4 reload >/dev/null 2>&1 || rollback_failed=1
+   if [ "$rollback_failed" = 0 ]; then
+    /usr/libexec/odac-config >/dev/null 2>&1 && /etc/init.d/opennds restart >/dev/null 2>&1 && /etc/init.d/odac reload >/dev/null 2>&1 && accept_runtime || rollback_failed=1
+   fi
+   if [ "$rollback_failed" != 0 ]; then
+    close_old || echo 'CRITICAL: cannot stop ODAC and reinstall the closed guard' >&2
+    /usr/libexec/odac-firewall close "$old_iface" >/dev/null 2>&1 || echo 'CRITICAL: cannot close the controlled network' >&2
+    echo 'CRITICAL: rollback apply failed; ODAC must remain stopped until repaired' >&2
+   fi
+  fi
+ fi
+ # On a failed config restore do not delete a certificate still referenced by
+ # the persisted config. It will be reclaimed by the next successful replacement.
+ if [ "$rc" -ne 0 ] && [ -n "$new_cert" ]; then
+  current_cert=$(command uci -q get odac.main.tls_cert 2>/dev/null)
+  [ "$current_cert" = "$new_cert/cert.pem" ] || rm -rf "$new_cert"
+ fi
+ cleanup
+ exit "$rc"
+}
+trap rollback EXIT
+
+valid_iface() { case "$1" in ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*|lo) return 1;; esac; [ "${#1}" -le 15 ]; }
+valid_ip() {
+ case "$1" in ''|*[!0-9.]*|.*|*.) return 1;; esac
+ oldifs=$IFS; IFS=.; set -- $1; IFS=$oldifs; [ "$#" -eq 4 ] || return 1
+ for part in "$@"; do case "$part" in ''|*[!0-9]*|0[0-9]*) return 1;; esac; [ "${#part}" -le 3 ] && [ "$part" -le 255 ] || return 1; done
+ [ "$1" -gt 0 ] && [ "$1" -lt 224 ] && [ "$1" -ne 127 ]
+}
+valid_port() { case "$1" in ''|*[!0-9]*|0*) return 1;; esac; [ "${#1}" -le 5 ] && [ "$1" -gt 1024 ] && [ "$1" -le 65535 ] && [ "$1" != 2050 ]; }
+
+if [ "$method" = upload_cert ]; then
+ [ "$#" = 3 ] && [ "$2" = --upload-dir ] || fail UPLOAD 'Use the configuration job upload staging directory'
+ upload=$3; jobdir=${upload%/upload}; jobid=${jobdir#/var/run/odac-config-job/}
+ [ "$upload" = "/var/run/odac-config-job/$jobid/upload" ] && [ "${#jobid}" = 32 ] || fail UPLOAD 'Invalid upload staging directory'
+ case "$jobid" in *[!0-9a-f]*) fail UPLOAD 'Invalid upload job identifier';; esac
+ for dir in /var/run/odac-config-job "$jobdir" "$upload"; do
+  [ -d "$dir" ] && [ ! -L "$dir" ] || fail UPLOAD 'Unsafe upload staging directory'
+  metadata=$(ls -ldn "$dir") || fail UPLOAD 'Cannot inspect upload staging'
+  [ "$(printf '%s\n' "$metadata" | awk '{print $1 ":" $3}')" = 'drwx------:0' ] || fail UPLOAD 'Upload staging must be private and root owned'
+ done
+ incoming=$(mktemp -d "$jobdir/.cert-upload-XXXXXXXX") || fail IO 'Cannot create private upload staging directory'
+ # Same-filesystem rename captures paths without following a symlink. Inspect
+ # only captured files inside the 0700 directory; copying first would race /tmp.
+ mv "$upload/cert.pem" "$incoming/cert.upload" || fail UPLOAD 'Certificate upload is missing'
+ mv "$upload/key.pem" "$incoming/key.upload" || fail UPLOAD 'Private key upload is missing'
+ for f in "$incoming/cert.upload" "$incoming/key.upload"; do
+  [ -f "$f" ] && [ ! -L "$f" ] || fail UPLOAD 'Both uploads must be regular files'
+  metadata=$(ls -ldn "$f") || fail UPLOAD 'Cannot inspect upload metadata'
+  owner=$(printf '%s\n' "$metadata" | awk '{print $3}')
+  mode=$(printf '%s\n' "$metadata" | awk '{print $1}')
+  links=$(printf '%s\n' "$metadata" | awk '{print $2}')
+  [ "$owner" = 0 ] && [ "$links" = 1 ] || fail UPLOAD 'Uploads must be root owned with a single link'
+  # Owner write is expected from rpcd uploads. Group/other may read, but must
+  # never write or execute (including setgid/sticky executable modes).
+  case "$mode" in -[r-][w-]-[r-]--[r-]--) :;; *) fail UPLOAD 'Unsafe upload permissions';; esac
+  size=$(wc -c < "$f"); [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || fail UPLOAD 'Certificate and key must each be at most 1 MiB'
+ done
+ # Validate only private copies; a privileged uploader still holding the old
+ # inode cannot change the installed bytes after validation.
+ head -c 1048577 "$incoming/cert.upload" > "$work/upload-cert.pem" && head -c 1048577 "$incoming/key.upload" > "$work/upload-key.pem" || fail UPLOAD 'Cannot stage uploaded files'
+ cert=$work/upload-cert.pem; key=$work/upload-key.pem
+ for f in "$cert" "$key"; do
+  size=$(wc -c < "$f"); [ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || fail UPLOAD 'Upload changed size during staging'
+ done
+ host=$(uci -q get odac.main.portal_hostname || true)
+ if [ -z "$host" ]; then
+  host=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 | sed -n 's/.*CN=\([^,]*\).*/\1/p')
+ fi
+ case "$host" in ''|*[!a-zA-Z0-9.-]*|.*|*.) fail INVALID 'Set a valid portal hostname before uploading';; esac
+ openssl x509 -in "$cert" -noout >/dev/null 2>&1 || fail CERTIFICATE 'Invalid X.509 certificate'
+ openssl pkey -in "$key" -passin pass: -noout >/dev/null 2>&1 || fail CERTIFICATE 'Invalid or encrypted private key'
+ openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1 || fail CERTIFICATE 'Certificate expires within one day'
+ openssl x509 -in "$cert" -noout -checkhost "$host" >/dev/null 2>&1 || fail CERTIFICATE 'Certificate hostname mismatch'
+ openssl x509 -in "$cert" -pubkey -noout > "$work/cert.pub" || fail CERTIFICATE 'Cannot read certificate public key'
+ openssl pkey -in "$key" -passin pass: -pubout > "$work/key.pub" 2>/dev/null || fail CERTIFICATE 'Cannot read private key public key'
+ cmp -s "$work/cert.pub" "$work/key.pub" || fail CERTIFICATE 'Certificate and private key do not match'
+ store=/etc/odac/certs; [ ! -L "$store" ] || fail PERMISSION 'Certificate store cannot be a symlink'
+ mkdir -p "$store"; chmod 700 "$store"
+ id=$(openssl rand -hex 16) || fail IO 'Cannot generate certificate identifier'
+ mkdir "$store/$id" || fail IO 'Cannot allocate certificate storage'
+ new_cert="$store/$id"
+ cp "$cert" "$new_cert/cert.pem" && chmod 644 "$new_cert/cert.pem" || fail IO 'Cannot store certificate'
+ cp "$key" "$new_cert/key.pem" && chmod 600 "$new_cert/key.pem" || fail IO 'Cannot store private key'
+ uci set "odac.main.portal_hostname=$host"
+ uci set "odac.main.tls_cert=$new_cert/cert.pem"
+ uci set "odac.main.tls_key=$new_cert/key.pem"
+else
+ for key in $keys; do
+  case "$key" in interface) value=$new_interface;; gateway) value=$new_gateway;; portal_hostname) value=$new_portal_hostname;; portal_https_port) value=$new_portal_https_port;; portal_port) value=$new_portal_port;; upstream) value=$new_upstream;; esac
+  case "$key" in
+   interface) valid_iface "$value" || fail INVALID 'Invalid controlled interface name';;
+   gateway) valid_ip "$value" || fail INVALID 'Gateway must be a valid IPv4 address';;
+   portal_hostname) case "$value" in ''|*[!a-zA-Z0-9.-]*|.*|*.) fail INVALID 'Invalid portal DNS hostname';; esac;;
+   portal_port|portal_https_port) valid_port "$value" || fail INVALID 'Portal ports must be 1025-65535 except 2050';;
+   upstream)
+    oldifs=$IFS; IFS=' ,'; set -- $value; IFS=$oldifs
+    [ "$#" -le 16 ] || fail INVALID 'At most 16 upstream IPv4 addresses are allowed'
+    for ip in "$@"; do valid_ip "$ip" || fail INVALID 'Upstream must contain IPv4 addresses only'; done;;
+  esac
+ done
+ [ "${new_portal_port-$old_http}" != "${new_portal_https_port-$old_https}" ] || fail INVALID 'HTTP and HTTPS ports must differ'
+ for key in $keys; do
+  case "$key" in interface) value=$new_interface;; gateway) value=$new_gateway;; portal_hostname) value=$new_portal_hostname;; portal_https_port) value=$new_portal_https_port;; portal_port) value=$new_portal_port;; upstream) value=$new_upstream;; esac
+  case "$key" in upstream) value=$(printf '%s' "$value" | tr ',' ' ' | tr -s ' ');; esac
+  uci set "odac.main.$key=$value"
+ done
+fi
+changed=1
+if [ "$active" = 1 ]; then close_old || fail GUARD 'Cannot stop ODAC and close the current controlled network'; fi
+uci commit odac || fail UCI 'Cannot persist ODAC settings'
+# Full preflight checks openNDS against the new HTTP/HTTPS ports too: stage its
+# candidate before validation so valid port changes do not inspect stale rules.
+if [ "$active" = 1 ]; then
+ iface=$(uci -q get odac.main.interface); gateway=$(uci -q get odac.main.gateway)
+ http=$(uci -q get odac.main.portal_port); https=$(uci -q get odac.main.portal_https_port)
+ uci set "opennds.@opennds[0].gatewayinterface=$iface"
+ uci set "opennds.@opennds[0].fasport=$http"
+ uci -q delete 'opennds.@opennds[0].users_to_router' || true
+ uci add_list "opennds.@opennds[0].users_to_router=allow tcp port $https"
+ uci set "firewall.odac_http.dest_port=$http"
+ uci set "firewall.odac_https.dest_port=$https"
+ uci commit opennds && uci commit firewall || fail UCI 'Cannot update active service configuration'
+ /usr/libexec/odac-preflight >/dev/null || fail PREFLIGHT 'Network configuration failed safety preflight'
+ /usr/libexec/odac-firewall init "$iface" "$gateway" "$http" "$https" $(uci -q get odac.main.upstream || true) || fail GUARD 'Cannot install closed guard for updated settings'
+ fw4 check >&2 && fw4 reload >&2 || fail FIREWALL 'Firewall validation or reload failed'
+ /etc/init.d/opennds restart >&2 || fail APPLY 'openNDS could not apply the new settings'
+ /usr/libexec/odac-config >&2 && /etc/init.d/odac reload >&2 || fail APPLY 'Updated configuration could not be activated'
+ accept_runtime || fail APPLY 'Updated services failed runtime acceptance probes'
+ odac_ownership_set gateway "$gateway"
+ for section in $sections; do
+  snapshot=$(uci -q show "firewall.$section") || fail OWNERSHIP 'Cannot verify updated firewall section'
+  digest=$(printf '%s\n' "$snapshot" | sha256sum)
+  odac_ownership_set "firewall_sha256_$section" "${digest%% *}"
+ done
+else
+ /usr/libexec/odac-preflight --config >/dev/null || fail PREFLIGHT 'Network settings failed validation'
+fi
+# Only reclaim our generated pair, never arbitrary administrator certificate
+# paths, nested directories, or a symlink. Keep the old pair on failure.
+if [ "$method" = upload_cert ]; then
+ old_dir=${old_cert%/cert.pem}; old_id=${old_dir#/etc/odac/certs/}
+ case "$old_id" in ''|*[!0-9a-f]*) :;; *)
+  if [ "${#old_id}" = 32 ] && [ "$old_key" = "$old_dir/key.pem" ] && [ "$old_dir" != "$new_cert" ] && [ ! -L "$old_dir" ]; then
+   rm -rf "$old_dir" || echo 'Cannot remove the previous certificate pair' >&2
+  fi;;
+ esac
+fi
+trap cleanup EXIT
+settings_json

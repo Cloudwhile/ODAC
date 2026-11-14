@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 case "${1:-}" in
- list) printf '%s\n' '{"overview":{"params":{}},"users":{"params":{}},"registrations":{"params":{}},"devices":{"params":{}},"wan":{"params":{}},"audit":{"params":{}},"settings":{"params":{}},"user_update":{"params":{}},"approve":{"params":{}},"reject":{"params":{}},"device_update":{"params":{}},"disconnect":{"params":{}},"settings_update":{"params":{}},"backup":{"params":{}},"restore":{"params":{}}}';;
+ list) printf '%s\n' '{"overview":{"params":{}},"users":{"params":{}},"registrations":{"params":{}},"devices":{"params":{}},"wan":{"params":{}},"audit":{"params":{}},"settings":{"params":{}},"user_update":{"params":{}},"approve":{"params":{}},"reject":{"params":{}},"device_update":{"params":{}},"disconnect":{"params":{}},"settings_update":{"params":{}},"backup":{"params":{}},"restore":{"params":{}},"network_update":{"params":{}},"upload_cert":{"params":{}},"network_job_status":{"params":{}}}';;
  call)
-  case "${2:-}" in overview|users|registrations|devices|wan|audit|settings|user_update|approve|reject|device_update|disconnect|settings_update|backup|restore) ;; *) printf '%s\n' '{"ok":false,"error":{"code":"METHOD","message":"Unknown method"}}'; exit 0;; esac
+  case "${2:-}" in overview|users|registrations|devices|wan|audit|settings|user_update|approve|reject|device_update|disconnect|settings_update|backup|restore|network_update|upload_cert|network_job_status) ;; *) printf '%s\n' '{"ok":false,"error":{"code":"METHOD","message":"Unknown method"}}'; exit 0;; esac
   input=$(head -c 65537)
   [ "${#input}" -le 65536 ] || { printf '%s\n' '{"ok":false,"error":{"code":"TOO_LARGE","message":"Request too large"}}'; exit 0; }
   # jshn.sh is not nounset safe: it unsets JSON_UNSET during json_cleanup and
@@ -18,9 +18,24 @@ case "${1:-}" in
    object) params=$(printf '%s' "$input" | jsonfilter -e '@.params');;
    *) printf '%s\n' '{"ok":false,"error":{"code":"PARAMS","message":"Params must be an object"}}'; exit 0;;
   esac
-  response=$(printf '%s\n' "$params" | /usr/bin/odacctl "$2") || {
-   [ -n "$response" ] || response='{"ok":false,"error":{"code":"UNAVAILABLE","message":"ODAC unavailable"}}'
-  }
+  if [ "$2" = network_update ] || [ "$2" = upload_cert ]; then
+   response=$(printf '%s\n' "$params" | /usr/libexec/odac-config-job "$2") || {
+    [ -n "$response" ] || response='{"ok":false,"error":{"code":"CONFIG","message":"Network configuration update failed"}}'
+   }
+  elif [ "$2" = network_job_status ]; then
+   response=$(printf '%s\n' "$params" | /usr/libexec/odac-config-job status) || {
+    [ -n "$response" ] || response='{"ok":false,"error":{"code":"UNAVAILABLE","message":"Job status unavailable"}}'
+   }
+  elif [ "$2" = settings ]; then
+   response=$(printf '%s\n' "$params" | /usr/bin/odacctl "$2") || response=''
+   if [ "$(printf '%s' "$response" | jsonfilter -e '@.ok' 2>/dev/null)" != true ]; then
+    response=$(/usr/libexec/odac-network-config settings) || response='{"ok":false,"error":{"code":"UNAVAILABLE","message":"Settings unavailable"}}'
+   fi
+  else
+   response=$(printf '%s\n' "$params" | /usr/bin/odacctl "$2") || {
+    [ -n "$response" ] || response='{"ok":false,"error":{"code":"UNAVAILABLE","message":"ODAC unavailable"}}'
+   }
+  fi
   printf '%s\n' "$response"
   exit 0
   ;;

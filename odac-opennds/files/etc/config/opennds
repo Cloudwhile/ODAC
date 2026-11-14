@@ -1,0 +1,14 @@
+# openNDS configuration for the ODAC admission backend.
+# Installed disabled. Only "odac-setup --enable" turns it on, for the
+# isolated controlled interface. Do not edit by hand while ODAC is active.
+config opennds
+	option odac_backend '1'
+	option enabled '0'
+	option gatewayinterface 'odac-unconfigured'
+	# No fw4 restart hook and no fw4 input accept rule: ODAC owns the
+	# firewall rules of the controlled zone.
+	option fwhook_enabled '0'
+	option users_to_router_passthrough '1'
+	# No status.client DNS entry and no DHCP option 114 changes.
+	option gatewayfqdn 'disable'
+	option dhcp_default_url_enable '0'

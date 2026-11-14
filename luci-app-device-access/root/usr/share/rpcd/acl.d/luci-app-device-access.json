@@ -3,7 +3,7 @@
 		"description": "Grant access to ODAC device access controller",
 		"read": {
 			"ubus": {
-				"odac": [ "overview", "users", "registrations", "devices", "wan", "audit", "settings" ]
+				"odac": [ "overview", "users", "registrations", "devices", "wan", "audit", "settings", "network_job_status" ]
 			},
 			"file": {
 				"/tmp/odac-backup.json": [ "read" ]
@@ -12,10 +12,12 @@
 		},
 		"write": {
 			"ubus": {
-				"odac": [ "user_update", "approve", "reject", "device_update", "disconnect", "settings_update", "backup", "restore" ]
+				"odac": [ "user_update", "approve", "reject", "device_update", "disconnect", "settings_update", "backup", "restore", "network_update", "upload_cert" ]
 			},
 			"file": {
-				"/tmp/odac-restore.json": [ "write" ]
+				"/tmp/odac-restore.json": [ "write" ],
+				"/tmp/odac-upload-cert.pem": [ "write" ],
+				"/tmp/odac-upload-key.pem": [ "write" ]
 			},
 			"cgi-io": [ "upload" ]
 		}

@@ -13,7 +13,8 @@ struct setting { const char *key; size_t offset; int min,max; };
 static const struct setting fields[]={
  FIELD(max_users,1,2000),FIELD(max_devices,1,5000),FIELD(max_sessions,1,ODAC_SESSIONS),
  FIELD(session_seconds,60,604800),FIELD(upload_kbps,0,ODAC_RATE_MAX),
- FIELD(download_kbps,0,ODAC_RATE_MAX),FIELD(max_audit,10,10000)
+ FIELD(download_kbps,0,ODAC_RATE_MAX),FIELD(max_audit,10,10000),
+ FIELD(wan_interval,5,30),FIELD(db_max_kib,512,65536)
 };
 int core_setting_valid(const char *key,long long value)
 {
@@ -54,10 +55,10 @@ static void add_portal_texts(struct odac *c,struct json_object *o)
 struct json_object *core_settings(struct odac *c)
 {
  struct json_object *o=json_object_new_object();
+ json_object_object_add(o,"daemon_available",json_object_new_boolean(1));
+ json_object_object_add(o,"config_enabled",json_object_new_boolean(c->config.enabled));
  for(size_t i=0;i<sizeof(fields)/sizeof(fields[0]);i++) core_addint(o,fields[i].key,*(int *)((char *)&c->config+fields[i].offset),1);
  core_addint(o,"default_devices",RT(c)->default_devices,1);
- core_addint(o,"wan_interval",c->config.wan_interval,1);
- core_addint(o,"db_max_kib",c->config.db_max_kib,1);
  core_addstr(o,"interface",c->config.interface);
  core_addstr(o,"gateway",c->config.gateway);
  core_addstr(o,"upstream",c->config.upstream);
@@ -87,7 +88,7 @@ int core_settings_load(struct odac *c)
   RT(c)->portal_enabled=core_has(o,"portal_enabled")?(int)core_ll(o,"portal_enabled"):1;
   for(int i=0;i<ODAC_PORTAL_TEXTS;i++) snprintf(RT(c)->portal_text[i],sizeof(RT(c)->portal_text[i]),"%s",core_str(o,core_portal_text_keys[i]));
  } else { json_object_put(o); return -1; }
- json_object_put(o); return 0;
+ json_object_put(o); return db_apply_limit(c);
 }
 struct json_object *core_settings_update(struct odac *c,struct json_object *p)
 {

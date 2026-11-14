@@ -1,0 +1,27 @@
+#!/bin/sh
+# This backend uses administrator-provisioned DNS/DHCP. Never silently ignore
+# an openNDS feature which would need to change the shared dnsmasq service.
+set -e
+. /lib/functions.sh
+fail() { printf 'odac-opennds: %s\n' "$*" >&2; exit 1; }
+sections=0
+check_section() {
+ local section="$1" value option
+ config_get value "$section" TYPE
+ [ "$value" = opennds ] || fail 'only one opennds section is supported; other section types may hide DNS policy'
+ sections=$((sections + 1))
+ config_get value "$section" odac_backend
+ [ "$value" = 1 ] || fail 'configuration is not owned by ODAC'
+ config_get value "$section" gatewayfqdn
+ case "$value" in disable|disabled) ;; *) fail 'gatewayfqdn must be disabled; DNS is administrator-managed';; esac
+ config_get value "$section" dhcp_default_url_enable
+ [ "$value" = 0 ] || fail 'DHCP option 114 management is unsupported by this backend'
+ for option in walledgarden_fqdn_list walledgarden_port_list blocklist_fqdn_list blocklist_port_list; do
+  config_get value "$section" "$option"
+  [ -z "$value" ] || fail "$option requires shared DNS changes and is unsupported by this backend"
+ done
+}
+config_load opennds || fail 'cannot read opennds configuration'
+# Upstream list parsing scans the whole export, irrespective of section type.
+config_foreach check_section
+[ "$sections" = 1 ] || fail 'exactly one opennds configuration section is required'
